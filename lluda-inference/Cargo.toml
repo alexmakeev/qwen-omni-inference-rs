@@ -1,0 +1,11 @@
+[package]
+name = "lluda-inference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust inference for Qwen Omni multimodal models"
+
+[dependencies]
+# Phase 0 will add: ndarray, safetensors, tokenizers, etc.
