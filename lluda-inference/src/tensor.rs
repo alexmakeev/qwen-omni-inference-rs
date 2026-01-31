@@ -464,6 +464,7 @@ impl Tensor {
 
         let data = self.to_vec_f32();
         let ndim = self.ndim();
+        let original_dtype = self.dtype();
 
         // Build new shape with swapped dimensions
         let mut new_shape = self.shape.clone();
@@ -509,7 +510,9 @@ impl Tensor {
             result[flat_dst] = data[flat_src];
         }
 
-        Tensor::new(result, new_shape)
+        // Preserve original dtype
+        let transposed = Tensor::new(result, new_shape)?;
+        transposed.to_dtype(original_dtype)
     }
 
     /// Remove dimensions of size 1 from the tensor shape.
@@ -1315,6 +1318,507 @@ impl Tensor {
         let mut new_shape = self.shape.clone();
         new_shape[dim] = 1;
         reduced.reshape(&new_shape)
+    }
+
+    /// Softmax activation along specified dimension.
+    ///
+    /// Computes numerically stable softmax:
+    /// ```text
+    /// softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+    /// ```
+    ///
+    /// The max subtraction prevents overflow when exponentiating large values,
+    /// which is critical for attention scores that can be very large.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - Dimension along which to compute softmax
+    ///
+    /// # Returns
+    ///
+    /// Tensor with same shape as input, where elements along `dim` sum to 1.0.
+    /// Result is always F32 regardless of input dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DimOutOfRange` if `dim >= ndim`.
+    ///
+    /// # Performance
+    ///
+    /// PERF: Current implementation allocates intermediate tensors (max, shifted, exp, sum).
+    /// Phase 3 optimizations:
+    /// - Fused kernel (single pass, no intermediate allocations)
+    /// - SIMD for exp computation
+    /// - In-place operations where possible
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+    /// let s = t.softmax(0).unwrap();
+    ///
+    /// // Probabilities sum to 1.0
+    /// let probs = s.to_vec_f32();
+    /// let sum: f32 = probs.iter().sum();
+    /// assert!((sum - 1.0).abs() < 1e-5);
+    ///
+    /// // Highest input has highest probability
+    /// assert!(probs[2] > probs[1] && probs[1] > probs[0]);
+    /// ```
+    pub fn softmax(&self, dim: usize) -> Result<Tensor> {
+        // 1. Check dim valid
+        if dim >= self.ndim() {
+            return Err(LludaError::DimOutOfRange {
+                dim,
+                ndim: self.ndim(),
+            });
+        }
+
+        // 2. Compute max along dim (for numerical stability)
+        let max_vals = self.max_keepdim(dim)?;
+
+        // 3. Subtract max and exp
+        let shifted = self.sub(&max_vals)?;
+        let exp_vals = shifted.exp()?;
+
+        // 4. Sum exp values
+        let sum_exp = exp_vals.sum_keepdim(dim)?;
+
+        // 5. Divide
+        exp_vals.div(&sum_exp)
+    }
+
+    /// SiLU (Swish) activation function: x * sigmoid(x) = x / (1 + exp(-x)).
+    ///
+    /// # Returns
+    ///
+    /// Tensor with SiLU activation applied element-wise.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// let t = Tensor::new(vec![0.0, 1.0, -1.0], vec![3]).unwrap();
+    /// let s = t.silu().unwrap();
+    ///
+    /// let result = s.to_vec_f32();
+    /// assert!((result[0] - 0.0).abs() < 1e-5); // silu(0) = 0
+    /// assert!((result[1] - 0.7311).abs() < 1e-3); // silu(1) ≈ 0.7311
+    /// assert!((result[2] - (-0.2689)).abs() < 1e-3); // silu(-1) ≈ -0.2689
+    /// ```
+    pub fn silu(&self) -> Result<Tensor> {
+        let data = self.to_vec_f32();
+        let result: Vec<f32> = data
+            .iter()
+            .map(|&x| {
+                // silu(x) = x / (1 + exp(-x))
+                x / (1.0 + (-x).exp())
+            })
+            .collect();
+        Tensor::new(result, self.shape.clone())
+    }
+
+    /// Compute mean along a dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - Dimension to reduce
+    ///
+    /// # Returns
+    ///
+    /// Tensor with mean values. The specified dimension is removed (size reduced to 1).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // Shape [2, 3]
+    /// let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+    ///
+    /// // Mean along dim 1 -> [2]
+    /// let m = t.mean(1).unwrap();
+    /// assert_eq!(m.shape(), &[2]);
+    ///
+    /// let result = m.to_vec_f32();
+    /// assert!((result[0] - 2.0).abs() < 1e-5); // (1+2+3)/3 = 2
+    /// assert!((result[1] - 5.0).abs() < 1e-5); // (4+5+6)/3 = 5
+    /// ```
+    pub fn mean(&self, dim: usize) -> Result<Tensor> {
+        if dim >= self.ndim() {
+            return Err(LludaError::DimOutOfRange {
+                dim,
+                ndim: self.ndim(),
+            });
+        }
+
+        // Sum along dimension, then divide by size of that dimension
+        let sum_tensor = self.sum(dim)?;
+        let dim_size = self.shape[dim] as f32;
+        sum_tensor.mul_scalar(1.0 / dim_size)
+    }
+
+    /// Select a sub-range along a dimension (slice).
+    ///
+    /// # Arguments
+    ///
+    /// * `dim` - Dimension to narrow
+    /// * `start` - Starting index (inclusive)
+    /// * `len` - Length of the slice
+    ///
+    /// # Returns
+    ///
+    /// Tensor view of the selected range. Data is copied (not a true view in Phase 0).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // Shape [3, 4]
+    /// let t = Tensor::new(
+    ///     vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+    ///     vec![3, 4],
+    /// )
+    /// .unwrap();
+    ///
+    /// // Select middle row: dim=0, start=1, len=1 -> [1, 4]
+    /// let n = t.narrow(0, 1, 1).unwrap();
+    /// assert_eq!(n.shape(), &[1, 4]);
+    /// assert_eq!(n.to_vec_f32(), vec![5.0, 6.0, 7.0, 8.0]);
+    ///
+    /// // Select last 2 columns: dim=1, start=2, len=2 -> [3, 2]
+    /// let n2 = t.narrow(1, 2, 2).unwrap();
+    /// assert_eq!(n2.shape(), &[3, 2]);
+    /// assert_eq!(n2.to_vec_f32(), vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]);
+    /// ```
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Tensor> {
+        if dim >= self.ndim() {
+            return Err(LludaError::DimOutOfRange {
+                dim,
+                ndim: self.ndim(),
+            });
+        }
+
+        if start + len > self.shape[dim] {
+            return Err(LludaError::Msg(format!(
+                "narrow: start {} + len {} exceeds dimension {} size {}",
+                start, len, dim, self.shape[dim]
+            )));
+        }
+
+        let data = self.to_vec_f32();
+        let ndim = self.ndim();
+
+        // Build new shape with narrowed dimension
+        let mut new_shape = self.shape.clone();
+        new_shape[dim] = len;
+
+        let new_numel: usize = new_shape.iter().product();
+        let mut result = vec![0.0f32; new_numel];
+
+        // Copy data for the selected range
+        let mut src_idx = vec![0usize; ndim];
+
+        // Iterate over all elements in the output
+        // Note: dst_flat is needed for result indexing while src_idx tracks multi-dimensional position
+        let src_strides = self.strides.clone();
+        #[allow(clippy::needless_range_loop)]
+        for dst_flat in 0..new_numel {
+            // Compute source index by offsetting the narrowed dimension
+            let mut src_multi_idx = src_idx.clone();
+            src_multi_idx[dim] += start;
+
+            // Compute source flat index
+            let src_flat: usize = src_multi_idx
+                .iter()
+                .zip(src_strides.iter())
+                .map(|(&i, &s)| i * s)
+                .sum();
+
+            result[dst_flat] = data[src_flat];
+
+            // Increment destination multi-index (odometer)
+            let mut carry = true;
+            for d in (0..ndim).rev() {
+                if carry {
+                    src_idx[d] += 1;
+                    if src_idx[d] >= new_shape[d] {
+                        src_idx[d] = 0;
+                    } else {
+                        carry = false;
+                    }
+                }
+            }
+        }
+
+        Tensor::new(result, new_shape)
+    }
+
+    /// Flatten dimensions [start_dim..=end_dim] into a single dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_dim` - First dimension to flatten (inclusive)
+    /// * `end_dim` - Last dimension to flatten (inclusive)
+    ///
+    /// # Returns
+    ///
+    /// Tensor with dimensions [start_dim..=end_dim] merged into one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // Shape [2, 3, 4]
+    /// let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    /// let t = Tensor::new(data, vec![2, 3, 4]).unwrap();
+    ///
+    /// // Flatten dims 0-1: [2, 3, 4] -> [6, 4]
+    /// let f = t.flatten(0, 1).unwrap();
+    /// assert_eq!(f.shape(), &[6, 4]);
+    ///
+    /// // Flatten dims 1-2: [2, 3, 4] -> [2, 12]
+    /// let f2 = t.flatten(1, 2).unwrap();
+    /// assert_eq!(f2.shape(), &[2, 12]);
+    ///
+    /// // Flatten all: [2, 3, 4] -> [24]
+    /// let f3 = t.flatten(0, 2).unwrap();
+    /// assert_eq!(f3.shape(), &[24]);
+    /// ```
+    pub fn flatten(&self, start_dim: usize, end_dim: usize) -> Result<Tensor> {
+        if start_dim > end_dim {
+            return Err(LludaError::Msg(format!(
+                "flatten: start_dim {} > end_dim {}",
+                start_dim, end_dim
+            )));
+        }
+
+        if end_dim >= self.ndim() {
+            return Err(LludaError::DimOutOfRange {
+                dim: end_dim,
+                ndim: self.ndim(),
+            });
+        }
+
+        // Compute new shape: keep dims before start_dim, merge [start_dim..=end_dim], keep dims after end_dim
+        let mut new_shape = Vec::new();
+
+        // Dims before start_dim
+        new_shape.extend_from_slice(&self.shape[..start_dim]);
+
+        // Merged dimension
+        let merged_size: usize = self.shape[start_dim..=end_dim].iter().product();
+        new_shape.push(merged_size);
+
+        // Dims after end_dim
+        if end_dim + 1 < self.ndim() {
+            new_shape.extend_from_slice(&self.shape[end_dim + 1..]);
+        }
+
+        self.reshape(&new_shape)
+    }
+
+    /// Concatenate tensors along a dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `tensors` - Slice of tensors to concatenate
+    /// * `dim` - Dimension along which to concatenate
+    ///
+    /// # Returns
+    ///
+    /// Concatenated tensor. All tensors must have the same shape except along `dim`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+    /// let t2 = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]).unwrap();
+    ///
+    /// // Concatenate along dim 0: [2, 2] + [2, 2] -> [4, 2]
+    /// let c = Tensor::cat(&[&t1, &t2], 0).unwrap();
+    /// assert_eq!(c.shape(), &[4, 2]);
+    /// assert_eq!(c.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    ///
+    /// // Concatenate along dim 1: [2, 2] + [2, 2] -> [2, 4]
+    /// let c2 = Tensor::cat(&[&t1, &t2], 1).unwrap();
+    /// assert_eq!(c2.shape(), &[2, 4]);
+    /// assert_eq!(c2.to_vec_f32(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    /// ```
+    pub fn cat(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(LludaError::Msg("cat: empty tensor list".to_string()));
+        }
+
+        let ndim = tensors[0].ndim();
+        if dim >= ndim {
+            return Err(LludaError::DimOutOfRange { dim, ndim });
+        }
+
+        // Verify all tensors have same shape except along dim
+        let first_shape = &tensors[0].shape;
+        for (i, t) in tensors.iter().enumerate().skip(1) {
+            if t.ndim() != ndim {
+                return Err(LludaError::Msg(format!(
+                    "cat: tensor {} has ndim {} but expected {}",
+                    i,
+                    t.ndim(),
+                    ndim
+                )));
+            }
+
+            for d in 0..ndim {
+                if d != dim && t.shape[d] != first_shape[d] {
+                    return Err(LludaError::ShapeMismatch {
+                        expected: first_shape.clone(),
+                        got: t.shape.clone(),
+                    });
+                }
+            }
+        }
+
+        // Compute output shape
+        let mut out_shape = first_shape.clone();
+        out_shape[dim] = tensors.iter().map(|t| t.shape[dim]).sum();
+
+        let out_numel: usize = out_shape.iter().product();
+        let mut result = vec![0.0f32; out_numel];
+
+        // Copy data from each tensor
+        let out_strides = compute_strides(&out_shape);
+        let mut out_offset_along_dim = 0usize;
+
+        for tensor in tensors {
+            let data = tensor.to_vec_f32();
+
+            // Iterate over all elements in this tensor
+            // Note: src_flat is needed for the odometer logic, not just indexing
+            let mut multi_idx = vec![0usize; ndim];
+            #[allow(clippy::needless_range_loop)]
+            for src_flat in 0..tensor.numel() {
+                // Compute multi-index for source
+                if src_flat > 0 {
+                    let mut carry = true;
+                    for d in (0..ndim).rev() {
+                        if carry {
+                            multi_idx[d] += 1;
+                            if multi_idx[d] >= tensor.shape[d] {
+                                multi_idx[d] = 0;
+                            } else {
+                                carry = false;
+                            }
+                        }
+                    }
+                }
+
+                // Compute output multi-index (offset along cat dimension)
+                let mut out_multi_idx = multi_idx.clone();
+                out_multi_idx[dim] += out_offset_along_dim;
+
+                // Compute output flat index
+                let out_flat: usize = out_multi_idx
+                    .iter()
+                    .zip(out_strides.iter())
+                    .map(|(&i, &s)| i * s)
+                    .sum();
+
+                result[out_flat] = data[src_flat];
+            }
+
+            out_offset_along_dim += tensor.shape[dim];
+        }
+
+        Tensor::new(result, out_shape)
+    }
+
+    /// Embedding lookup: index into first dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `indices` - Tensor of indices (must be dtype F32 but values are integers)
+    ///
+    /// # Returns
+    ///
+    /// Tensor with shape [indices.shape..., self.shape[1..]].
+    /// For typical embedding: self is [vocab, dim], indices is [B, L] -> output is [B, L, dim]
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // Embedding matrix: [vocab=5, dim=3]
+    /// let embed = Tensor::new(
+    ///     vec![
+    ///         1.0, 2.0, 3.0, // token 0
+    ///         4.0, 5.0, 6.0, // token 1
+    ///         7.0, 8.0, 9.0, // token 2
+    ///         10.0, 11.0, 12.0, // token 3
+    ///         13.0, 14.0, 15.0, // token 4
+    ///     ],
+    ///     vec![5, 3],
+    /// )
+    /// .unwrap();
+    ///
+    /// // Indices: [2, 2] (batch=2, seq_len=2)
+    /// let indices = Tensor::new(vec![0.0, 1.0, 2.0, 3.0], vec![2, 2]).unwrap();
+    ///
+    /// // Lookup: [5, 3].embedding([2, 2]) -> [2, 2, 3]
+    /// let out = embed.embedding(&indices).unwrap();
+    /// assert_eq!(out.shape(), &[2, 2, 3]);
+    ///
+    /// let result = out.to_vec_f32();
+    /// assert_eq!(&result[0..3], &[1.0, 2.0, 3.0]); // token 0
+    /// assert_eq!(&result[3..6], &[4.0, 5.0, 6.0]); // token 1
+    /// assert_eq!(&result[6..9], &[7.0, 8.0, 9.0]); // token 2
+    /// assert_eq!(&result[9..12], &[10.0, 11.0, 12.0]); // token 3
+    /// ```
+    pub fn embedding(&self, indices: &Tensor) -> Result<Tensor> {
+        let data = self.to_vec_f32();
+        let indices_data = indices.to_vec_f32();
+
+        // Compute output shape: indices.shape + self.shape[1..]
+        let mut out_shape = indices.shape.clone();
+        if self.ndim() > 1 {
+            out_shape.extend_from_slice(&self.shape[1..]);
+        }
+
+        let vocab_size = self.shape[0];
+        let embed_dim: usize = if self.ndim() > 1 {
+            self.shape[1..].iter().product()
+        } else {
+            1
+        };
+
+        let num_indices = indices.numel();
+        let out_numel = num_indices * embed_dim;
+        let mut result = vec![0.0f32; out_numel];
+
+        for (i, &idx_f32) in indices_data.iter().enumerate() {
+            let idx = idx_f32 as usize;
+
+            if idx >= vocab_size {
+                return Err(LludaError::Msg(format!(
+                    "embedding: index {} out of range for vocab size {}",
+                    idx, vocab_size
+                )));
+            }
+
+            // Copy embedding vector for this index
+            let src_offset = idx * embed_dim;
+            let dst_offset = i * embed_dim;
+            result[dst_offset..dst_offset + embed_dim]
+                .copy_from_slice(&data[src_offset..src_offset + embed_dim]);
+        }
+
+        Tensor::new(result, out_shape)
     }
 
     /// Create a tensor filled with zeros.
@@ -3222,6 +3726,213 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ========== Softmax Tests ==========
+
+    #[test]
+    fn test_softmax_1d() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        let s = t.softmax(0).unwrap();
+        let probs = s.to_vec_f32();
+
+        // Probabilities sum to 1.0
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum={}, expected 1.0", sum);
+
+        // Values are positive
+        assert!(probs.iter().all(|&p| p > 0.0), "all probs should be positive");
+
+        // Highest input has highest probability
+        assert!(
+            probs[2] > probs[1] && probs[1] > probs[0],
+            "probs should be monotonically increasing"
+        );
+
+        // Result is F32
+        assert_eq!(s.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn test_softmax_2d_dim0() {
+        // Shape [2, 3], softmax along dim 0 (across rows)
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let s = t.softmax(0).unwrap();
+
+        assert_eq!(s.shape(), &[2, 3]);
+        assert_eq!(s.dtype(), DType::F32);
+
+        let probs = s.to_vec_f32();
+
+        // Each column should sum to 1.0
+        // Column 0: probs[0] + probs[3]
+        // Column 1: probs[1] + probs[4]
+        // Column 2: probs[2] + probs[5]
+        let col0_sum = probs[0] + probs[3];
+        let col1_sum = probs[1] + probs[4];
+        let col2_sum = probs[2] + probs[5];
+
+        assert!((col0_sum - 1.0).abs() < 1e-5);
+        assert!((col1_sum - 1.0).abs() < 1e-5);
+        assert!((col2_sum - 1.0).abs() < 1e-5);
+
+        // Within each column, second row should have higher probability (higher value)
+        assert!(probs[3] > probs[0]); // col 0
+        assert!(probs[4] > probs[1]); // col 1
+        assert!(probs[5] > probs[2]); // col 2
+    }
+
+    #[test]
+    fn test_softmax_2d_dim1() {
+        // Shape [2, 3], softmax along dim 1 (across columns)
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let s = t.softmax(1).unwrap();
+
+        assert_eq!(s.shape(), &[2, 3]);
+        assert_eq!(s.dtype(), DType::F32);
+
+        let probs = s.to_vec_f32();
+
+        // Each row should sum to 1.0
+        // Row 0: probs[0] + probs[1] + probs[2]
+        // Row 1: probs[3] + probs[4] + probs[5]
+        let row0_sum: f32 = probs[0..3].iter().sum();
+        let row1_sum: f32 = probs[3..6].iter().sum();
+
+        assert!((row0_sum - 1.0).abs() < 1e-5);
+        assert!((row1_sum - 1.0).abs() < 1e-5);
+
+        // Within each row, probabilities should be monotonically increasing
+        assert!(probs[2] > probs[1] && probs[1] > probs[0]); // row 0
+        assert!(probs[5] > probs[4] && probs[4] > probs[3]); // row 1
+    }
+
+    #[test]
+    fn test_softmax_numerical_stability_large_values() {
+        // Large values that would overflow without max subtraction
+        let t = Tensor::new(vec![1000.0, 1001.0, 1002.0], vec![3]).unwrap();
+        let s = t.softmax(0).unwrap();
+        let probs = s.to_vec_f32();
+
+        // Should not produce NaN or Inf
+        assert!(probs.iter().all(|&p| p.is_finite()), "all probs should be finite");
+
+        // Should sum to 1.0
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum={}, expected 1.0", sum);
+
+        // Highest input has highest probability
+        assert!(probs[2] > probs[1] && probs[1] > probs[0]);
+    }
+
+    #[test]
+    fn test_softmax_uniform_distribution() {
+        // All zeros should produce uniform distribution
+        let t = Tensor::new(vec![0.0, 0.0, 0.0], vec![3]).unwrap();
+        let s = t.softmax(0).unwrap();
+        let probs = s.to_vec_f32();
+
+        // Each should be approximately 1/3
+        let expected = 1.0 / 3.0;
+        for &p in &probs {
+            assert!((p - expected).abs() < 1e-6, "p={}, expected {}", p, expected);
+        }
+
+        // Sum to 1.0
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_3d() {
+        // Shape [2, 2, 2], softmax along dim 2
+        let t = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![2, 2, 2],
+        )
+        .unwrap();
+        let s = t.softmax(2).unwrap();
+
+        assert_eq!(s.shape(), &[2, 2, 2]);
+        let probs = s.to_vec_f32();
+
+        // Each pair along last dim should sum to 1.0
+        // [0,1], [2,3], [4,5], [6,7]
+        for i in 0..4 {
+            let pair_sum = probs[i * 2] + probs[i * 2 + 1];
+            assert!((pair_sum - 1.0).abs() < 1e-5, "pair {} sum={}", i, pair_sum);
+
+            // Second element should have higher probability (higher value)
+            assert!(probs[i * 2 + 1] > probs[i * 2]);
+        }
+    }
+
+    #[test]
+    fn test_softmax_4d() {
+        // Attention-like shape: [1, 2, 3, 3] (batch, heads, seq, seq)
+        // Softmax along last dim
+        let data: Vec<f32> = (0..18).map(|i| i as f32).collect();
+        let t = Tensor::new(data, vec![1, 2, 3, 3]).unwrap();
+        let s = t.softmax(3).unwrap();
+
+        assert_eq!(s.shape(), &[1, 2, 3, 3]);
+        let probs = s.to_vec_f32();
+
+        // Each row of 3 elements should sum to 1.0
+        for i in 0..6 {
+            // 6 rows total (1*2*3)
+            let row_sum: f32 = probs[i * 3..(i + 1) * 3].iter().sum();
+            assert!((row_sum - 1.0).abs() < 1e-5, "row {} sum={}", i, row_sum);
+        }
+    }
+
+    #[test]
+    fn test_softmax_bf16_input() {
+        // BF16 input should be converted to F32 for compute
+        let bf16_data = vec![
+            BF16::from(1.0f32),
+            BF16::from(2.0f32),
+            BF16::from(3.0f32),
+        ];
+        let t = Tensor::from_bf16(bf16_data, vec![3]).unwrap();
+        let s = t.softmax(0).unwrap();
+
+        // Result should be F32
+        assert_eq!(s.dtype(), DType::F32);
+
+        let probs = s.to_vec_f32();
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+
+        // Should match F32 version (within BF16 precision)
+        let t_f32 = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        let s_f32 = t_f32.softmax(0).unwrap();
+        let probs_f32 = s_f32.to_vec_f32();
+
+        for (i, (&p, &p_f32)) in probs.iter().zip(probs_f32.iter()).enumerate() {
+            assert!(
+                (p - p_f32).abs() < 1e-3,
+                "index {}: bf16={}, f32={}",
+                i,
+                p,
+                p_f32
+            );
+        }
+    }
+
+    #[test]
+    fn test_softmax_dim_out_of_range() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        let result = t.softmax(1); // dim=1 is out of range for 1D tensor
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LludaError::DimOutOfRange { dim, ndim } => {
+                assert_eq!(dim, 1);
+                assert_eq!(ndim, 1);
+            }
+            _ => panic!("Expected DimOutOfRange error"),
+        }
+    }
+
     // ========== Zeros Constructor Tests ==========
 
     #[test]
@@ -3238,5 +3949,258 @@ mod tests {
         assert_eq!(t.shape(), &[3]);
         assert_eq!(t.dtype(), DType::BF16);
         assert_eq!(t.to_vec_f32(), vec![0.0, 0.0, 0.0]);
+    }
+
+    // ========== SiLU Tests ==========
+
+    #[test]
+    fn test_silu_basic() {
+        let t = Tensor::new(vec![0.0, 1.0, -1.0], vec![3]).unwrap();
+        let s = t.silu().unwrap();
+
+        let result = s.to_vec_f32();
+        assert!((result[0] - 0.0).abs() < 1e-5); // silu(0) = 0
+        assert!((result[1] - 0.7311).abs() < 1e-3); // silu(1) ≈ 0.7311
+        assert!((result[2] - (-0.2689)).abs() < 1e-3); // silu(-1) ≈ -0.2689
+    }
+
+    #[test]
+    fn test_silu_2d() {
+        let t = Tensor::new(vec![0.0, 1.0, -1.0, 2.0], vec![2, 2]).unwrap();
+        let s = t.silu().unwrap();
+
+        assert_eq!(s.shape(), &[2, 2]);
+        let result = s.to_vec_f32();
+        assert!((result[0] - 0.0).abs() < 1e-5);
+        assert!((result[1] - 0.7311).abs() < 1e-3);
+    }
+
+    // ========== Mean Tests ==========
+
+    #[test]
+    fn test_mean_basic() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+
+        // Mean along dim 1 -> [2]
+        let m = t.mean(1).unwrap();
+        assert_eq!(m.shape(), &[2]);
+
+        let result = m.to_vec_f32();
+        assert!((result[0] - 2.0).abs() < 1e-5); // (1+2+3)/3 = 2
+        assert!((result[1] - 5.0).abs() < 1e-5); // (4+5+6)/3 = 5
+    }
+
+    #[test]
+    fn test_mean_dim0() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+
+        // Mean along dim 0 -> [3]
+        let m = t.mean(0).unwrap();
+        assert_eq!(m.shape(), &[3]);
+
+        let result = m.to_vec_f32();
+        assert!((result[0] - 2.5).abs() < 1e-5); // (1+4)/2 = 2.5
+        assert!((result[1] - 3.5).abs() < 1e-5); // (2+5)/2 = 3.5
+        assert!((result[2] - 4.5).abs() < 1e-5); // (3+6)/2 = 4.5
+    }
+
+    // ========== Narrow Tests ==========
+
+    #[test]
+    fn test_narrow_rows() {
+        let t = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![3, 4],
+        )
+        .unwrap();
+
+        // Select middle row: dim=0, start=1, len=1 -> [1, 4]
+        let n = t.narrow(0, 1, 1).unwrap();
+        assert_eq!(n.shape(), &[1, 4]);
+        assert_eq!(n.to_vec_f32(), vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_narrow_cols() {
+        let t = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![3, 4],
+        )
+        .unwrap();
+
+        // Select last 2 columns: dim=1, start=2, len=2 -> [3, 2]
+        let n = t.narrow(1, 2, 2).unwrap();
+        assert_eq!(n.shape(), &[3, 2]);
+        assert_eq!(n.to_vec_f32(), vec![3.0, 4.0, 7.0, 8.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn test_narrow_out_of_bounds() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+
+        // Start + len exceeds dimension size
+        let result = t.narrow(0, 1, 2);
+        assert!(result.is_err());
+    }
+
+    // ========== Flatten Tests ==========
+
+    #[test]
+    fn test_flatten_first_two_dims() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = Tensor::new(data, vec![2, 3, 4]).unwrap();
+
+        // Flatten dims 0-1: [2, 3, 4] -> [6, 4]
+        let f = t.flatten(0, 1).unwrap();
+        assert_eq!(f.shape(), &[6, 4]);
+        assert_eq!(f.numel(), 24);
+    }
+
+    #[test]
+    fn test_flatten_last_two_dims() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = Tensor::new(data, vec![2, 3, 4]).unwrap();
+
+        // Flatten dims 1-2: [2, 3, 4] -> [2, 12]
+        let f = t.flatten(1, 2).unwrap();
+        assert_eq!(f.shape(), &[2, 12]);
+        assert_eq!(f.numel(), 24);
+    }
+
+    #[test]
+    fn test_flatten_all() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = Tensor::new(data.clone(), vec![2, 3, 4]).unwrap();
+
+        // Flatten all: [2, 3, 4] -> [24]
+        let f = t.flatten(0, 2).unwrap();
+        assert_eq!(f.shape(), &[24]);
+        assert_eq!(f.to_vec_f32(), data);
+    }
+
+    // ========== Cat Tests ==========
+
+    #[test]
+    fn test_cat_dim0() {
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let t2 = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]).unwrap();
+
+        // Concatenate along dim 0: [2, 2] + [2, 2] -> [4, 2]
+        let c = Tensor::cat(&[&t1, &t2], 0).unwrap();
+        assert_eq!(c.shape(), &[4, 2]);
+        assert_eq!(c.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_cat_dim1() {
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let t2 = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]).unwrap();
+
+        // Concatenate along dim 1: [2, 2] + [2, 2] -> [2, 4]
+        let c = Tensor::cat(&[&t1, &t2], 1).unwrap();
+        assert_eq!(c.shape(), &[2, 4]);
+        assert_eq!(c.to_vec_f32(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_cat_three_tensors() {
+        let t1 = Tensor::new(vec![1.0, 2.0], vec![2]).unwrap();
+        let t2 = Tensor::new(vec![3.0, 4.0], vec![2]).unwrap();
+        let t3 = Tensor::new(vec![5.0, 6.0], vec![2]).unwrap();
+
+        let c = Tensor::cat(&[&t1, &t2, &t3], 0).unwrap();
+        assert_eq!(c.shape(), &[6]);
+        assert_eq!(c.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_cat_shape_mismatch() {
+        // Test with 2D tensors that have incompatible shapes
+        let t1_2d = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let t2_2d = Tensor::new(vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0], vec![2, 3]).unwrap();
+
+        // Can concatenate along dim 1 (different sizes OK there)
+        let c = Tensor::cat(&[&t1_2d, &t2_2d], 1).unwrap();
+        assert_eq!(c.shape(), &[2, 5]);
+
+        // Cannot concatenate along dim 0 (dim 1 sizes differ)
+        let result = Tensor::cat(&[&t1_2d, &t2_2d], 0);
+        assert!(result.is_err());
+    }
+
+    // ========== Embedding Tests ==========
+
+    #[test]
+    fn test_embedding_basic() {
+        // Embedding matrix: [vocab=5, dim=3]
+        let embed = Tensor::new(
+            vec![
+                1.0, 2.0, 3.0, // token 0
+                4.0, 5.0, 6.0, // token 1
+                7.0, 8.0, 9.0, // token 2
+                10.0, 11.0, 12.0, // token 3
+                13.0, 14.0, 15.0, // token 4
+            ],
+            vec![5, 3],
+        )
+        .unwrap();
+
+        // Indices: [2, 2] (batch=2, seq_len=2)
+        let indices = Tensor::new(vec![0.0, 1.0, 2.0, 3.0], vec![2, 2]).unwrap();
+
+        // Lookup: [5, 3].embedding([2, 2]) -> [2, 2, 3]
+        let out = embed.embedding(&indices).unwrap();
+        assert_eq!(out.shape(), &[2, 2, 3]);
+
+        let result = out.to_vec_f32();
+        assert_eq!(&result[0..3], &[1.0, 2.0, 3.0]); // token 0
+        assert_eq!(&result[3..6], &[4.0, 5.0, 6.0]); // token 1
+        assert_eq!(&result[6..9], &[7.0, 8.0, 9.0]); // token 2
+        assert_eq!(&result[9..12], &[10.0, 11.0, 12.0]); // token 3
+    }
+
+    #[test]
+    fn test_embedding_single_index() {
+        let embed = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let indices = Tensor::new(vec![1.0], vec![1]).unwrap();
+
+        let out = embed.embedding(&indices).unwrap();
+        assert_eq!(out.shape(), &[1, 3]);
+        assert_eq!(out.to_vec_f32(), vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_embedding_out_of_bounds() {
+        let embed = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let indices = Tensor::new(vec![0.0, 5.0], vec![2]).unwrap(); // index 5 is out of bounds
+
+        let result = embed.embedding(&indices);
+        assert!(result.is_err());
+    }
+
+    // ========== Transpose Dims BF16 Preservation Test ==========
+
+    #[test]
+    fn test_transpose_dims_preserves_bf16() {
+        // Create BF16 tensor
+        let bf16_data = vec![
+            BF16::from(1.0f32),
+            BF16::from(2.0f32),
+            BF16::from(3.0f32),
+            BF16::from(4.0f32),
+        ];
+        let t = Tensor::from_bf16(bf16_data, vec![2, 2]).unwrap();
+
+        // Transpose should preserve BF16 dtype
+        let transposed = t.transpose_dims(0, 1).unwrap();
+        assert_eq!(transposed.dtype(), DType::BF16);
+        assert_eq!(transposed.shape(), &[2, 2]);
+
+        // Verify values are still correct
+        let data = transposed.to_vec_f32();
+        assert!((data[0] - 1.0).abs() < 1e-3);
+        assert!((data[1] - 3.0).abs() < 1e-3);
+        assert!((data[2] - 2.0).abs() < 1e-3);
+        assert!((data[3] - 4.0).abs() < 1e-3);
     }
 }

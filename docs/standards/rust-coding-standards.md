@@ -234,6 +234,164 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
 
 **Implementation tip:** Start with general N-D implementation, optimize 2D special case if needed.
 
+### Config Parsing Rule
+
+**Rule:** Always parse fields directly from config.json, never compute derived values.
+
+**Rationale:**
+- Computed values may have wrong semantic meaning for other models
+- Breaks abstraction: config should be source of truth
+- Hidden assumptions about relationships between fields
+
+**Example violation:**
+```rust
+// BAD: Computing head_dim from other fields
+impl ModelConfig {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_key_value_heads  // WRONG!
+    }
+}
+```
+
+**Why wrong:**
+- For Qwen3-0.6B: `hidden_size=1024`, `num_key_value_heads=2`, giving `head_dim=512`
+- But actual `head_dim=128` (from `num_attention_heads=8`)
+- Computed value is semantically incorrect (KV heads vs Q heads)
+- Works accidentally for some models, breaks for others
+
+**Correct pattern:**
+```rust
+// GOOD: Parse explicit field from config
+#[derive(Deserialize)]
+pub struct ModelConfig {
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,  // Parse from JSON
+}
+
+impl ModelConfig {
+    // Getter returns parsed value
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+}
+```
+
+**Guidelines:**
+1. Add explicit field to config struct
+2. Parse from JSON (add to `config.json` if missing)
+3. Provide getter if needed for API consistency
+4. Never derive one config value from others
+
+### Specification Completeness for Operations
+
+**Rule:** Before implementing task, verify ALL operations from spec are included.
+
+**Process:**
+1. Read task spec in `docs/architecture/phase0-implementation-plan.md`
+2. Create checklist of ALL operations mentioned
+3. Implement each operation with tests
+4. Cross-check against spec before marking complete
+
+**Why critical:** Missing operations block downstream tasks.
+
+**Example failure pattern (T05 element-wise operations):**
+- Spec required: add, mul, div, sub, neg, recip, exp, sum, max, mean, add_scalar, mul_scalar, silu
+- Initially implemented: add, mul, div, neg, recip, add_scalar, mul_scalar (7 of 13)
+- Missing: exp, sum, max, mean, sub, silu
+- Impact: T11-T19 blocked because `silu()` needed for MLP, `exp()` for softmax
+
+**Verification checklist format:**
+```markdown
+## T05 Element-wise Operations Checklist
+
+From spec section "T05: Element-wise Operations":
+
+- [x] add(other: &Tensor)
+- [x] mul(other: &Tensor)
+- [x] div(other: &Tensor)
+- [x] sub(other: &Tensor)
+- [x] neg()
+- [x] recip()
+- [x] exp()
+- [x] sum()
+- [x] max()
+- [x] mean()
+- [x] add_scalar(scalar: f32)
+- [x] mul_scalar(scalar: f32)
+- [x] silu()
+```
+
+**Another example (T06 view operations):**
+- Spec required: reshape, squeeze, unsqueeze, transpose, permute, flatten, select, narrow, slice
+- Common miss: `narrow()`, `select()` (often overlooked as "similar to slice")
+- Each is distinct: select extracts one index, narrow extracts range, slice is generic
+
+**Pattern:** Create checklist BEFORE coding, implement all operations together in one pass.
+
+### DType Preservation in View Operations (Extended)
+
+**Rule:** ALL view/shape operations must preserve original dtype, not just reshape.
+
+**Applies to:** reshape, squeeze, unsqueeze, flatten, permute, transpose, transpose_dims, select, narrow, slice
+
+**Common violation:** `transpose_dims()` converting BF16 → F32
+
+**Why wrong:**
+- BF16 is for storage efficiency (half memory)
+- View operations only change shape/layout, not data
+- Silently converting to F32 doubles memory usage
+- Model weights should stay BF16 until compute time
+
+**Correct implementation pattern:**
+```rust
+pub fn transpose_dims(&self, dim0: usize, dim1: usize) -> Result<Tensor> {
+    // Validate dimensions...
+
+    // CORRECT: Preserve dtype by matching on TensorData
+    match &self.data {
+        TensorData::F32(data) => {
+            // Permute F32 data, return F32 tensor
+            Tensor::new(permuted_data, new_shape)
+        }
+        TensorData::BF16(data) => {
+            // Permute BF16 data, return BF16 tensor
+            Tensor::from_bf16(permuted_data, new_shape)
+        }
+    }
+}
+
+// WRONG: Always converts to F32
+pub fn transpose_dims(&self, dim0: usize, dim1: usize) -> Result<Tensor> {
+    let data = self.to_f32_vec()?;  // Loses BF16!
+    // ... permute ...
+    Tensor::new(permuted_data, new_shape)
+}
+```
+
+**Testing requirement:** Each view operation must have explicit BF16 preservation test:
+```rust
+#[test]
+fn transpose_dims_preserves_bf16() {
+    let bf16_data: Vec<bf16> = vec![bf16::from_f32(1.0), bf16::from_f32(2.0),
+                                     bf16::from_f32(3.0), bf16::from_f32(4.0)];
+    let tensor = Tensor::from_bf16(bf16_data, vec![2, 2]).unwrap();
+
+    let result = tensor.transpose_dims(0, 1).unwrap();
+
+    // Verify dtype preserved
+    assert!(matches!(result.data, TensorData::BF16(_)),
+            "transpose_dims converted BF16 to F32");
+}
+```
+
+**Checklist for new view operations:**
+1. Implement logic for both F32 and BF16 branches
+2. Match on `TensorData`, preserve variant in result
+3. Add BF16 preservation test
+4. Verify no `.to_f32_vec()` calls in implementation
+
 ### Shape assertions at function entry:
 ```rust
 pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {

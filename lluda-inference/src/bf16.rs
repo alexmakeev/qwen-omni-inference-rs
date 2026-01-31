@@ -37,6 +37,23 @@ use std::fmt;
 pub struct BF16(u16);
 
 impl BF16 {
+    /// Create a BF16 from raw bits.
+    ///
+    /// This is used when loading BF16 data from binary formats like SafeTensors.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::bf16::BF16;
+    ///
+    /// let bf16 = BF16::from_bits(0x3F80); // 1.0 in BF16
+    /// let f32_val = f32::from(bf16);
+    /// assert_eq!(f32_val, 1.0f32);
+    /// ```
+    pub fn from_bits(bits: u16) -> Self {
+        BF16(bits)
+    }
+
     /// Convert a slice of BF16 values to F32 for computation.
     ///
     /// This is a batch operation optimized for tensor weight loading.
@@ -358,5 +375,26 @@ mod tests {
                 "NN value: {}, Recovered: {}, Error: {}",
                 val, recovered, abs_error);
         }
+    }
+
+    #[test]
+    fn test_from_bits() {
+        // Test loading BF16 from raw bits (as done when loading from SafeTensors)
+        let bits_1_0 = 0x3F80u16; // 1.0 in BF16 format
+        let bf16 = BF16::from_bits(bits_1_0);
+        let f32_val = f32::from(bf16);
+        assert_eq!(f32_val, 1.0f32, "BF16 bits 0x3F80 should be 1.0");
+
+        // Test zero
+        let bits_0_0 = 0x0000u16;
+        let bf16 = BF16::from_bits(bits_0_0);
+        let f32_val = f32::from(bf16);
+        assert_eq!(f32_val, 0.0f32, "BF16 bits 0x0000 should be 0.0");
+
+        // Test negative one
+        let bits_neg_1 = 0xBF80u16; // -1.0 in BF16 format
+        let bf16 = BF16::from_bits(bits_neg_1);
+        let f32_val = f32::from(bf16);
+        assert_eq!(f32_val, -1.0f32, "BF16 bits 0xBF80 should be -1.0");
     }
 }
