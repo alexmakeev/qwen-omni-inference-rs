@@ -32,3 +32,10 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# MCP tools
+.ckb/
+
+# Beads task tracking
+.beads/
+

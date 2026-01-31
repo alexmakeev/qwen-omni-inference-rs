@@ -5,4 +5,7 @@
 
 #![warn(missing_docs)]
 
-// Phase 0: Infrastructure modules will go here
+// Phase 0: Infrastructure modules
+pub mod error;
+pub mod bf16;
+pub mod tensor;

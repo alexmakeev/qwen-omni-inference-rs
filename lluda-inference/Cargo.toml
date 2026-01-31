@@ -8,4 +8,5 @@ repository.workspace = true
 description = "Pure Rust inference for Qwen Omni multimodal models"
 
 [dependencies]
-# Phase 0 will add: ndarray, safetensors, tokenizers, etc.
+thiserror = "2"
+serde_json = "1"
