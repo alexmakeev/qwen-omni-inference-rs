@@ -21,3 +21,7 @@ pub mod attention;
 pub mod mlp;
 pub mod transformer;
 pub mod causal_mask;
+pub mod model;
+
+// Generation
+pub mod generate;

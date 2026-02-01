@@ -1851,6 +1851,127 @@ impl Tensor {
             }
         }
     }
+
+    /// Find the index of the maximum value along the last dimension.
+    ///
+    /// # Returns
+    ///
+    /// Tensor of indices with shape [...] (last dimension removed).
+    /// Each element is the index (as u32) of the maximum value along the last dimension.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // 1D: [3] -> scalar
+    /// let t = Tensor::new(vec![1.0, 3.0, 2.0], vec![3]).unwrap();
+    /// let idx = t.argmax_last_dim().unwrap();
+    /// assert_eq!(idx, 1); // Index of max value 3.0
+    ///
+    /// // 2D: [2, 4] -> [2]
+    /// let t = Tensor::new(
+    ///     vec![1.0, 4.0, 2.0, 3.0, 5.0, 2.0, 3.0, 1.0],
+    ///     vec![2, 4],
+    /// ).unwrap();
+    /// let indices = t.argmax_last_dim_tensor().unwrap();
+    /// assert_eq!(indices.shape(), &[2]);
+    /// let data = indices.to_vec_f32();
+    /// assert_eq!(data[0] as u32, 1); // Max in row 0 is at index 1 (value 4.0)
+    /// assert_eq!(data[1] as u32, 0); // Max in row 1 is at index 0 (value 5.0)
+    /// ```
+    pub fn argmax_last_dim(&self) -> Result<u32> {
+        if self.ndim() == 0 {
+            return Err(LludaError::Msg(
+                "argmax_last_dim requires at least 1D tensor".to_string(),
+            ));
+        }
+
+        let data = self.to_vec_f32();
+
+        if self.ndim() == 1 {
+            // Simple case: find max in 1D array
+            let (max_idx, _) = data
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .ok_or_else(|| LludaError::Msg("Empty tensor".to_string()))?;
+
+            return Ok(max_idx as u32);
+        }
+
+        // For ND tensors, we need to find argmax of the LAST row
+        let last_dim_size = self.shape[self.ndim() - 1];
+        let start = data.len() - last_dim_size;
+
+        let (max_idx, _) = data[start..]
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| LludaError::Msg("Empty tensor".to_string()))?;
+
+        Ok(max_idx as u32)
+    }
+
+    /// Find the index of the maximum value along the last dimension (returns tensor).
+    ///
+    /// # Returns
+    ///
+    /// Tensor of u32 indices with shape [...] (last dimension removed).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// // 2D case
+    /// let t = Tensor::new(
+    ///     vec![1.0, 4.0, 2.0, 3.0, 5.0, 2.0, 3.0, 1.0],
+    ///     vec![2, 4],
+    /// ).unwrap();
+    /// let indices = t.argmax_last_dim_tensor().unwrap();
+    /// assert_eq!(indices.shape(), &[2]);
+    /// ```
+    pub fn argmax_last_dim_tensor(&self) -> Result<Tensor> {
+        if self.ndim() == 0 {
+            return Err(LludaError::Msg(
+                "argmax_last_dim_tensor requires at least 1D tensor".to_string(),
+            ));
+        }
+
+        let data = self.to_vec_f32();
+        let last_dim_size = self.shape[self.ndim() - 1];
+
+        // Output shape: remove last dimension
+        let output_shape = self.shape[..self.ndim() - 1].to_vec();
+        let num_rows: usize = if output_shape.is_empty() {
+            1
+        } else {
+            output_shape.iter().product()
+        };
+
+        let mut result = Vec::with_capacity(num_rows);
+
+        for row_idx in 0..num_rows {
+            let start = row_idx * last_dim_size;
+            let end = start + last_dim_size;
+
+            let (max_idx, _) = data[start..end]
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .ok_or_else(|| LludaError::Msg("Empty slice".to_string()))?;
+
+            result.push(max_idx as f32);
+        }
+
+        if output_shape.is_empty() {
+            // Scalar result
+            Tensor::new(result, vec![1])
+        } else {
+            Tensor::new(result, output_shape)
+        }
+    }
 }
 
 /// Compute broadcast shape from two shapes using NumPy broadcasting rules.
@@ -4202,5 +4323,112 @@ mod tests {
         assert!((data[1] - 3.0).abs() < 1e-3);
         assert!((data[2] - 2.0).abs() < 1e-3);
         assert!((data[3] - 4.0).abs() < 1e-3);
+    }
+
+    // ========== Argmax Tests ==========
+
+    #[test]
+    fn test_argmax_last_dim_1d() {
+        // Simple 1D case
+        let t = Tensor::new(vec![1.0, 3.0, 2.0], vec![3]).unwrap();
+        let idx = t.argmax_last_dim().unwrap();
+        assert_eq!(idx, 1, "Max value 3.0 is at index 1");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_2d() {
+        // 2D case: [2, 4]
+        let t = Tensor::new(
+            vec![1.0, 4.0, 2.0, 3.0, 5.0, 2.0, 3.0, 1.0],
+            vec![2, 4],
+        )
+        .unwrap();
+
+        // Should return argmax of LAST row
+        let idx = t.argmax_last_dim().unwrap();
+        assert_eq!(idx, 0, "Last row [5.0, 2.0, 3.0, 1.0] max is at index 0");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_3d() {
+        // 3D case: [1, 2, 3] - should use last 3 elements
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 2.0], vec![1, 2, 3]).unwrap();
+
+        let idx = t.argmax_last_dim().unwrap();
+        assert_eq!(idx, 1, "Last row [4.0, 5.0, 2.0] max is at index 1");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_tensor_2d() {
+        // 2D case with tensor output
+        let t = Tensor::new(
+            vec![1.0, 4.0, 2.0, 3.0, 5.0, 2.0, 3.0, 1.0],
+            vec![2, 4],
+        )
+        .unwrap();
+
+        let indices = t.argmax_last_dim_tensor().unwrap();
+        assert_eq!(indices.shape(), &[2], "Output should remove last dim");
+
+        let data = indices.to_vec_f32();
+        assert_eq!(data[0] as u32, 1, "Row 0 max is at index 1 (value 4.0)");
+        assert_eq!(data[1] as u32, 0, "Row 1 max is at index 0 (value 5.0)");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_tensor_3d() {
+        // 3D case: [2, 2, 3]
+        let t = Tensor::new(
+            vec![
+                1.0, 2.0, 3.0, // [0, 0, :] max at 2
+                4.0, 5.0, 2.0, // [0, 1, :] max at 1
+                2.0, 1.0, 3.0, // [1, 0, :] max at 2
+                5.0, 4.0, 6.0, // [1, 1, :] max at 2
+            ],
+            vec![2, 2, 3],
+        )
+        .unwrap();
+
+        let indices = t.argmax_last_dim_tensor().unwrap();
+        assert_eq!(indices.shape(), &[2, 2], "Output shape should be [2, 2]");
+
+        let data = indices.to_vec_f32();
+        assert_eq!(data[0] as u32, 2, "[0, 0, :] max at index 2");
+        assert_eq!(data[1] as u32, 1, "[0, 1, :] max at index 1");
+        assert_eq!(data[2] as u32, 2, "[1, 0, :] max at index 2");
+        assert_eq!(data[3] as u32, 2, "[1, 1, :] max at index 2");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_tensor_1d() {
+        // 1D case should return scalar
+        let t = Tensor::new(vec![1.0, 5.0, 3.0], vec![3]).unwrap();
+        let indices = t.argmax_last_dim_tensor().unwrap();
+
+        assert_eq!(indices.shape(), &[1], "1D input should produce scalar");
+
+        let data = indices.to_vec_f32();
+        assert_eq!(data[0] as u32, 1, "Max at index 1");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_negative_values() {
+        // Test with negative values
+        let t = Tensor::new(vec![-5.0, -1.0, -3.0], vec![3]).unwrap();
+        let idx = t.argmax_last_dim().unwrap();
+        assert_eq!(idx, 1, "Max of [-5.0, -1.0, -3.0] is -1.0 at index 1");
+    }
+
+    #[test]
+    fn test_argmax_last_dim_all_same() {
+        // All values the same - implementation may return any index
+        // (Rust's max_by doesn't guarantee first on ties)
+        let t = Tensor::new(vec![2.0, 2.0, 2.0], vec![3]).unwrap();
+        let idx = t.argmax_last_dim().unwrap();
+        assert!(
+            idx < 3,
+            "Index should be valid (0-2), got {}",
+            idx
+        );
     }
 }

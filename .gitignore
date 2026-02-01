@@ -11,6 +11,9 @@ models/
 *.bin
 *.npz
 
+# Reference data (generated)
+reference_data/
+
 # Old code
 old/
 

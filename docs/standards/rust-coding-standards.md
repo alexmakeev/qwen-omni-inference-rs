@@ -677,6 +677,41 @@ pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
 // Not needed for Phase 0. Keep it simple: constructors and methods.
 ```
 
+## Input Validation at API Boundaries
+
+**Rule:** All public API functions MUST validate inputs at entry point before processing. Fail-fast principle.
+
+**Rationale:**
+- Catch errors early with clear context
+- Found violation: `model.forward()` didn't validate empty `input_ids`, error surfaced deep in `narrow()` operation
+- Better UX: "input_ids cannot be empty" vs cryptic tensor operation error
+
+**Pattern - WRONG:**
+```rust
+pub fn forward(&mut self, input_ids: &[u32]) -> Result<Tensor> {
+    // No validation, empty input causes error in narrow() later
+    let seq_len = input_ids.len();
+    // ... crashes on narrow when seq_len=0
+}
+```
+
+**Pattern - CORRECT:**
+```rust
+pub fn forward(&mut self, input_ids: &[u32]) -> Result<Tensor> {
+    if input_ids.is_empty() {
+        return Err(LludaError::Msg("input_ids cannot be empty".into()));
+    }
+    let seq_len = input_ids.len();
+    // ...
+}
+```
+
+**Common validations:**
+- Empty inputs (slices, vectors)
+- Out of range values (token IDs > vocab_size)
+- Invalid dimensions (batch_size=0)
+- Conflicting parameters (max_tokens=0, temperature=0)
+
 ---
 
 ## 5. Documentation
