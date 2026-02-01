@@ -32,7 +32,7 @@ use crate::tensor::Tensor;
 #[derive(Debug, Clone)]
 pub struct Linear {
     /// Weight matrix [out_features, in_features]
-    weight: Tensor,
+    pub(crate) weight: Tensor,
 }
 
 impl Linear {
@@ -91,7 +91,7 @@ impl Linear {
     /// use lluda_inference::tensor::Tensor;
     ///
     /// let weight = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
-    /// let linear = Linear::new(weight);
+    /// let linear = Linear::new(weight).unwrap();
     ///
     /// let x = Tensor::new(vec![1.0, 2.0], vec![1, 2]).unwrap();
     /// let y = linear.forward(&x).unwrap();
@@ -206,15 +206,15 @@ impl Attention {
     /// let num_kv_heads = 2;
     /// let head_dim = 16;
     ///
-    /// let q_proj = Linear::new(Tensor::new(vec![0.0; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap());
-    /// let k_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap());
-    /// let v_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap());
-    /// let o_proj = Linear::new(Tensor::new(vec![0.0; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap());
-    /// let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6);
-    /// let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6);
+    /// let q_proj = Linear::new(Tensor::new(vec![0.0; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()).unwrap();
+    /// let k_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
+    /// let v_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
+    /// let o_proj = Linear::new(Tensor::new(vec![0.0; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()).unwrap();
+    /// let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
+    /// let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
     ///
-    /// let attn = Attention::new(q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads, head_dim);
+    /// let attn = Attention::new(q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads, head_dim).unwrap();
     /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -228,15 +228,14 @@ impl Attention {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Self {
+    ) -> Result<Self> {
+        // Validate GQA: num_heads must be divisible by num_kv_heads
         #[allow(clippy::manual_is_multiple_of)]
-        {
-            assert!(
-                num_heads % num_kv_heads == 0,
+        if num_heads % num_kv_heads != 0 {
+            return Err(crate::error::LludaError::Model(format!(
                 "num_heads ({}) must be divisible by num_kv_heads ({})",
-                num_heads,
-                num_kv_heads
-            );
+                num_heads, num_kv_heads
+            )));
         }
 
         // Validate projection weight shapes
@@ -245,38 +244,34 @@ impl Attention {
         let v_shape = v_proj.weight.shape();
         let o_shape = o_proj.weight.shape();
 
-        assert_eq!(
-            q_shape[0],
-            num_heads * head_dim,
-            "q_proj output features ({}) must equal num_heads * head_dim ({})",
-            q_shape[0],
-            num_heads * head_dim
-        );
-        assert_eq!(
-            k_shape[0],
-            num_kv_heads * head_dim,
-            "k_proj output features ({}) must equal num_kv_heads * head_dim ({})",
-            k_shape[0],
-            num_kv_heads * head_dim
-        );
-        assert_eq!(
-            v_shape[0],
-            num_kv_heads * head_dim,
-            "v_proj output features ({}) must equal num_kv_heads * head_dim ({})",
-            v_shape[0],
-            num_kv_heads * head_dim
-        );
-        assert_eq!(
-            o_shape[1],
-            num_heads * head_dim,
-            "o_proj input features ({}) must equal num_heads * head_dim ({})",
-            o_shape[1],
-            num_heads * head_dim
-        );
+        if q_shape[0] != num_heads * head_dim {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![num_heads * head_dim, q_shape[1]],
+                got: q_shape.to_vec(),
+            });
+        }
+        if k_shape[0] != num_kv_heads * head_dim {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![num_kv_heads * head_dim, k_shape[1]],
+                got: k_shape.to_vec(),
+            });
+        }
+        if v_shape[0] != num_kv_heads * head_dim {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![num_kv_heads * head_dim, v_shape[1]],
+                got: v_shape.to_vec(),
+            });
+        }
+        if o_shape[1] != num_heads * head_dim {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![o_shape[0], num_heads * head_dim],
+                got: o_shape.to_vec(),
+            });
+        }
 
         let num_kv_groups = num_heads / num_kv_heads;
 
-        Attention {
+        Ok(Attention {
             q_proj,
             k_proj,
             v_proj,
@@ -288,7 +283,7 @@ impl Attention {
             num_kv_heads,
             num_kv_groups,
             head_dim,
-        }
+        })
     }
 
     /// Forward pass through attention layer.
@@ -516,6 +511,18 @@ impl KvCache {
                 k.clone()
             }
             Some(k_cached) => {
+                // Validate shape compatibility before concatenation
+                // Dims 0 (batch), 1 (num_kv_heads), 3 (head_dim) must match
+                let k_shape = k.shape();
+                let cached_shape = k_cached.shape();
+
+                if k_shape[0] != cached_shape[0] || k_shape[1] != cached_shape[1] || k_shape[3] != cached_shape[3] {
+                    return Err(crate::error::LludaError::ShapeMismatch {
+                        expected: vec![cached_shape[0], cached_shape[1], 0, cached_shape[3]], // seq_len can vary
+                        got: k_shape.to_vec(),
+                    });
+                }
+
                 // Concatenate along sequence dimension (dim=2)
                 Tensor::cat(&[k_cached, k], 2)?
             }
@@ -527,6 +534,18 @@ impl KvCache {
                 v.clone()
             }
             Some(v_cached) => {
+                // Validate shape compatibility before concatenation
+                // Dims 0 (batch), 1 (num_kv_heads), 3 (head_dim) must match
+                let v_shape = v.shape();
+                let cached_shape = v_cached.shape();
+
+                if v_shape[0] != cached_shape[0] || v_shape[1] != cached_shape[1] || v_shape[3] != cached_shape[3] {
+                    return Err(crate::error::LludaError::ShapeMismatch {
+                        expected: vec![cached_shape[0], cached_shape[1], 0, cached_shape[3]], // seq_len can vary
+                        got: v_shape.to_vec(),
+                    });
+                }
+
                 // Concatenate along sequence dimension (dim=2)
                 Tensor::cat(&[v_cached, v], 2)?
             }
@@ -648,20 +667,20 @@ mod tests {
         let result_data = result.to_vec_f32();
 
         // First group should repeat head 0
-        for i in 0..12 {
-            assert_eq!(result_data[i], i as f32);
+        for (i, value) in result_data.iter().enumerate().take(12) {
+            assert_eq!(*value, i as f32);
         }
         // Second group should also be head 0
-        for i in 0..12 {
-            assert_eq!(result_data[12 + i], i as f32);
+        for (i, value) in result_data.iter().enumerate().skip(12).take(12) {
+            assert_eq!(*value, (i - 12) as f32);
         }
         // Third group should be head 1
-        for i in 0..12 {
-            assert_eq!(result_data[24 + i], (12 + i) as f32);
+        for (i, value) in result_data.iter().enumerate().skip(24).take(12) {
+            assert_eq!(*value, (i - 12) as f32);
         }
         // Fourth group should also be head 1
-        for i in 0..12 {
-            assert_eq!(result_data[36 + i], (12 + i) as f32);
+        for (i, value) in result_data.iter().enumerate().skip(36).take(12) {
+            assert_eq!(*value, (i - 24) as f32);
         }
     }
 
@@ -759,7 +778,7 @@ mod tests {
         let attn = Attention::new(
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
             head_dim,
-        );
+        ).unwrap();
 
         // Input tensor
         let x = Tensor::new(vec![0.5; batch * seq_len * hidden_size], vec![batch, seq_len, hidden_size]).unwrap();
@@ -817,7 +836,7 @@ mod tests {
         let attn = Attention::new(
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
             head_dim,
-        );
+        ).unwrap();
 
         // Input tensor
         let x = Tensor::new(
@@ -828,7 +847,7 @@ mod tests {
 
         // Create causal mask: [B, 1, L, L]
         // Upper triangle should be -inf (masked out)
-        let mut mask_data = vec![0.0f32; batch * 1 * seq_len * seq_len];
+        let mut mask_data = vec![0.0f32; batch * seq_len * seq_len];
         for i in 0..seq_len {
             for j in 0..seq_len {
                 if j > i {
@@ -899,7 +918,7 @@ mod tests {
         let attn = Attention::new(
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
             head_dim,
-        );
+        ).unwrap();
 
         let mut cache = KvCache::new();
 
@@ -915,7 +934,7 @@ mod tests {
 
         // Step 2: Generate next token (seq_len=1)
         let x2 = Tensor::new(
-            vec![0.6; batch * 1 * hidden_size],
+            vec![0.6; batch * hidden_size],
             vec![batch, 1, hidden_size],
         )
         .unwrap();
@@ -925,7 +944,7 @@ mod tests {
 
         // Step 3: Generate another token (seq_len=1)
         let x3 = Tensor::new(
-            vec![0.7; batch * 1 * hidden_size],
+            vec![0.7; batch * hidden_size],
             vec![batch, 1, hidden_size],
         )
         .unwrap();
@@ -944,9 +963,174 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "num_heads (5) must be divisible by num_kv_heads (2)")]
+    fn test_kv_cache_preserves_old_values() {
+        // Verify that appending to cache preserves old values (doesn't overwrite)
+        let mut cache = KvCache::new();
+
+        // First append: 2 tokens with distinct values
+        // Shape: [batch=1, num_kv_heads=2, seq_len=2, head_dim=2]
+        // Total elements: 1 * 2 * 2 * 2 = 8
+        let k1_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let v1_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let k1 = Tensor::new(k1_data.clone(), vec![1, 2, 2, 2]).unwrap();
+        let v1 = Tensor::new(v1_data.clone(), vec![1, 2, 2, 2]).unwrap();
+
+        let (k_full, v_full) = cache.append(&k1, &v1).unwrap();
+
+        // Verify first append returns input as-is
+        assert_eq!(k_full.to_vec_f32(), k1_data);
+        assert_eq!(v_full.to_vec_f32(), v1_data);
+
+        // Second append: 1 token with different values
+        // Shape: [batch=1, num_kv_heads=2, seq_len=1, head_dim=2]
+        // Total elements: 1 * 2 * 1 * 2 = 4
+        let k2_data: Vec<f32> = vec![100.0, 200.0, 300.0, 400.0];
+        let v2_data: Vec<f32> = vec![1000.0, 2000.0, 3000.0, 4000.0];
+        let k2 = Tensor::new(k2_data.clone(), vec![1, 2, 1, 2]).unwrap();
+        let v2 = Tensor::new(v2_data.clone(), vec![1, 2, 1, 2]).unwrap();
+
+        let (k_full, v_full) = cache.append(&k2, &v2).unwrap();
+
+        // Verify shape: should be 3 tokens total (2 + 1)
+        assert_eq!(k_full.shape(), &[1, 2, 3, 2]);
+        assert_eq!(v_full.shape(), &[1, 2, 3, 2]);
+
+        let k_result = k_full.to_vec_f32();
+        let v_result = v_full.to_vec_f32();
+
+        // After concatenation, layout should be:
+        // [batch=0, head=0, seq=0, :] = k1[0,0,0,:] = [1.0, 2.0]
+        // [batch=0, head=0, seq=1, :] = k1[0,0,1,:] = [3.0, 4.0]
+        // [batch=0, head=0, seq=2, :] = k2[0,0,0,:] = [100.0, 200.0]
+        // [batch=0, head=1, seq=0, :] = k1[0,1,0,:] = [5.0, 6.0]
+        // [batch=0, head=1, seq=1, :] = k1[0,1,1,:] = [7.0, 8.0]
+        // [batch=0, head=1, seq=2, :] = k2[0,1,0,:] = [300.0, 400.0]
+
+        assert_eq!(k_result.len(), 12); // 1 * 2 * 3 * 2 = 12
+        assert_eq!(v_result.len(), 12);
+
+        // Verify old k values are preserved
+        assert_eq!(k_result[0], 1.0, "k[0,0,0,0]");
+        assert_eq!(k_result[1], 2.0, "k[0,0,0,1]");
+        assert_eq!(k_result[2], 3.0, "k[0,0,1,0]");
+        assert_eq!(k_result[3], 4.0, "k[0,0,1,1]");
+        // New value appended
+        assert_eq!(k_result[4], 100.0, "k[0,0,2,0] - new");
+        assert_eq!(k_result[5], 200.0, "k[0,0,2,1] - new");
+        // Second head old values
+        assert_eq!(k_result[6], 5.0, "k[0,1,0,0]");
+        assert_eq!(k_result[7], 6.0, "k[0,1,0,1]");
+        assert_eq!(k_result[8], 7.0, "k[0,1,1,0]");
+        assert_eq!(k_result[9], 8.0, "k[0,1,1,1]");
+        // Second head new value
+        assert_eq!(k_result[10], 300.0, "k[0,1,2,0] - new");
+        assert_eq!(k_result[11], 400.0, "k[0,1,2,1] - new");
+
+        // Verify old v values are preserved
+        assert_eq!(v_result[0], 10.0, "v[0,0,0,0]");
+        assert_eq!(v_result[1], 20.0, "v[0,0,0,1]");
+        assert_eq!(v_result[2], 30.0, "v[0,0,1,0]");
+        assert_eq!(v_result[3], 40.0, "v[0,0,1,1]");
+        assert_eq!(v_result[4], 1000.0, "v[0,0,2,0] - new");
+        assert_eq!(v_result[5], 2000.0, "v[0,0,2,1] - new");
+        assert_eq!(v_result[6], 50.0, "v[0,1,0,0]");
+        assert_eq!(v_result[7], 60.0, "v[0,1,0,1]");
+        assert_eq!(v_result[8], 70.0, "v[0,1,1,0]");
+        assert_eq!(v_result[9], 80.0, "v[0,1,1,1]");
+        assert_eq!(v_result[10], 3000.0, "v[0,1,2,0] - new");
+        assert_eq!(v_result[11], 4000.0, "v[0,1,2,1] - new");
+    }
+
+    #[test]
+    fn test_integration_causal_mask_with_attention() {
+        // Integration test: verify causal_mask() integrates correctly with Attention::forward()
+        use crate::causal_mask::causal_mask;
+        use crate::tensor::DType;
+
+        let batch = 1;
+        let seq_len = 4;
+        let hidden_size = 64;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 16;
+
+        // Create attention layer
+        let q_proj = Linear::new(
+            Tensor::new(
+                vec![0.1; num_heads * head_dim * hidden_size],
+                vec![num_heads * head_dim, hidden_size],
+            )
+            .unwrap(),
+        ).unwrap();
+        let k_proj = Linear::new(
+            Tensor::new(
+                vec![0.1; num_kv_heads * head_dim * hidden_size],
+                vec![num_kv_heads * head_dim, hidden_size],
+            )
+            .unwrap(),
+        ).unwrap();
+        let v_proj = Linear::new(
+            Tensor::new(
+                vec![0.1; num_kv_heads * head_dim * hidden_size],
+                vec![num_kv_heads * head_dim, hidden_size],
+            )
+            .unwrap(),
+        ).unwrap();
+        let o_proj = Linear::new(
+            Tensor::new(
+                vec![0.1; hidden_size * num_heads * head_dim],
+                vec![hidden_size, num_heads * head_dim],
+            )
+            .unwrap(),
+        ).unwrap();
+        let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
+        let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
+        let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
+
+        let attn = Attention::new(
+            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            head_dim,
+        ).unwrap();
+
+        // Create input
+        let x = Tensor::new(
+            vec![0.5; batch * seq_len * hidden_size],
+            vec![batch, seq_len, hidden_size],
+        ).unwrap();
+
+        // Generate causal mask using the causal_mask function
+        let mask = causal_mask(batch, seq_len, 0, DType::F32).unwrap();
+        assert!(mask.is_some(), "causal_mask should return Some for seq_len > 1");
+        let mask = mask.unwrap();
+
+        // Verify mask shape
+        assert_eq!(mask.shape(), &[batch, 1, seq_len, seq_len]);
+
+        // Forward pass with generated mask
+        let mut cache = KvCache::new();
+        let output = attn.forward(&x, Some(&mask), &mut cache, 0).unwrap();
+
+        // Verify output
+        assert_eq!(output.shape(), &[batch, seq_len, hidden_size]);
+        let output_data = output.to_vec_f32();
+        assert!(
+            output_data.iter().all(|&x| x.is_finite()),
+            "Output should be finite with causal mask"
+        );
+
+        // Test generation step (seq_len=1, should get None mask)
+        let x_gen = Tensor::new(vec![0.6; batch * hidden_size], vec![batch, 1, hidden_size]).unwrap();
+        let mask_gen = causal_mask(batch, 1, seq_len, DType::F32).unwrap();
+        assert!(mask_gen.is_none(), "causal_mask should return None for seq_len=1");
+
+        let output_gen = attn.forward(&x_gen, mask_gen.as_ref(), &mut cache, seq_len).unwrap();
+        assert_eq!(output_gen.shape(), &[batch, 1, hidden_size]);
+        assert!(output_gen.to_vec_f32().iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
     fn test_attention_invalid_head_configuration() {
-        // num_heads=5, num_kv_heads=2 should panic (not divisible)
+        // num_heads=5, num_kv_heads=2 should return error (not divisible)
         let hidden_size = 64;
         let num_heads = 5;
         let num_kv_heads = 2;
@@ -984,10 +1168,19 @@ mod tests {
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
-        // This should panic
-        Attention::new(
+        // This should return error
+        let result = Attention::new(
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
             head_dim,
         );
+
+        assert!(result.is_err(), "Expected error for invalid head configuration");
+        match result.unwrap_err() {
+            crate::error::LludaError::Model(msg) => {
+                assert!(msg.contains("num_heads"));
+                assert!(msg.contains("divisible"));
+            }
+            other => panic!("Expected Model error, got: {:?}", other),
+        }
     }
 }

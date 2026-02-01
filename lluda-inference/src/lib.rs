@@ -18,3 +18,6 @@ pub mod embedding;
 pub mod rms_norm;
 pub mod rope;
 pub mod attention;
+pub mod mlp;
+pub mod transformer;
+pub mod causal_mask;

@@ -1047,3 +1047,22 @@ Next: Git commit T07-T10 + fixes, continue with T11-T22 (model components)
 - Tied embeddings pattern may differ for Omni (depends on architecture)
 
 **Next:** T12 (RMSNorm) — can start immediately, dependency on element-wise ops satisfied
+
+## 2026-02-01 02:01
+
+Done: T15-T18 implementation + Opus review + fixes complete
+- T15: MLP (mlp.rs) - 15 tests, SiLU gated MLP: down_proj(silu(gate_proj(x)) * up_proj(x))
+- T16: Transformer Block (transformer.rs) - 7 tests, pre-norm architecture, dual residuals
+- T17: KV Cache - already complete in attention.rs from T14, verified spec compliance
+- T18: Causal Mask (causal_mask.rs) - 9 tests, lower-triangular mask generator, seq_len=1 optimization
+
+Opus review found: 1 critical (assert! panic), 8 warnings (validation, tests), 4 suggestions
+Applied fixes:
+- C1: Attention::new returns Result<Self>, all assert! replaced with proper error returns (NO PANICS in library)
+- W2, W5, W7: Added MLP negative input test, KvCache shape validation, causal_mask zero-size validation
+- S1, S3, S4: Fixed MLP doc comments, added KV cache data preservation test, integration test causal_mask->Attention
+
+Tests: 293 passing (was 260, added 33 tests), 0 clippy warnings
+Updated coding standards: "No Panics in Library Code (Strict Enforcement)" - prohibits panic!/assert!/unwrap() in src/
+
+Next: T19-T22 (Full Model Assembly, Generation Loop, Python Reference, Validation)

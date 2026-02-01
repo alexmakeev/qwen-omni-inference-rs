@@ -113,7 +113,7 @@ impl RmsNorm {
     /// use lluda_inference::tensor::Tensor;
     ///
     /// let weight = Tensor::new(vec![1.0; 4], vec![4]).unwrap();
-    /// let norm = RmsNorm::new(weight, 1e-6);
+    /// let norm = RmsNorm::new(weight, 1e-6).unwrap();
     ///
     /// let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]).unwrap();
     /// let output = norm.forward(&x).unwrap();
@@ -436,7 +436,7 @@ mod tests {
         let norm = RmsNorm::new(weight, 1e-6).unwrap();
 
         // Create random-like input (not all ones to test actual normalization)
-        let mut input_data = vec![0.0f32; 1 * 4 * 1024];
+        let mut input_data = vec![0.0f32; 4 * 1024];
         for (i, val) in input_data.iter_mut().enumerate() {
             *val = (i % 100) as f32 / 100.0; // Values in [0, 0.99]
         }

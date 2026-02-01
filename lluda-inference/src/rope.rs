@@ -539,10 +539,10 @@ mod tests {
         let rope = RotaryEmbedding::new(8, 100, 10000.0).unwrap();
 
         // Q: [1, 16, 4, 8] (16 query heads)
-        let q = Tensor::new(vec![1.0; 1 * 16 * 4 * 8], vec![1, 16, 4, 8]).unwrap();
+        let q = Tensor::new(vec![1.0; 16 * 4 * 8], vec![1, 16, 4, 8]).unwrap();
 
         // K: [1, 8, 4, 8] (8 key heads, GQA)
-        let k = Tensor::new(vec![2.0; 1 * 8 * 4 * 8], vec![1, 8, 4, 8]).unwrap();
+        let k = Tensor::new(vec![2.0; 8 * 4 * 8], vec![1, 8, 4, 8]).unwrap();
 
         let (q_rot, k_rot) = rope.apply(&q, &k, 0).unwrap();
 

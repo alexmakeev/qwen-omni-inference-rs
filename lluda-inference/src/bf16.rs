@@ -18,7 +18,7 @@
 //! ```rust
 //! use lluda_inference::bf16::BF16;
 //!
-//! let original = 3.14159f32;
+//! let original = std::f32::consts::PI;
 //! let bf16 = BF16::from(original);
 //! let recovered = f32::from(bf16);
 //!
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_round_trip_precision() {
         // BF16 has ~3 decimal places precision
-        let original = 3.14159f32;
+        let original = std::f32::consts::PI;
         let bf16 = BF16::from(original);
         let recovered = f32::from(bf16);
 
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_display() {
-        let bf16 = BF16::from(3.14159f32);
+        let bf16 = BF16::from(std::f32::consts::PI);
         let display_str = format!("{}", bf16);
 
         // Should display as F32 value
@@ -350,7 +350,7 @@ mod tests {
         let bf16 = BF16::from(1.5f32);
 
         // Test Clone
-        let cloned = bf16.clone();
+        let cloned = bf16;
         assert_eq!(bf16, cloned);
 
         // Test Copy (implicit)

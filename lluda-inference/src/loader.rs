@@ -213,7 +213,7 @@ mod tests {
         let weights = ModelWeights::from_safetensors(&path).unwrap();
 
         // Model should have tensors
-        assert!(weights.len() > 0, "Model should have loaded tensors");
+        assert!(!weights.is_empty(), "Model should have loaded tensors");
 
         // Check key tensors exist
         assert!(
@@ -493,7 +493,7 @@ mod tests {
 
         let weights = ModelWeights::from_safetensors(&path).unwrap();
 
-        assert!(weights.len() > 0, "Should have tensors");
+        assert!(!weights.is_empty(), "Should have tensors");
         assert!(!weights.is_empty(), "Should not be empty");
     }
 }

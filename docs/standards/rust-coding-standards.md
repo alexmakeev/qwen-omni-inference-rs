@@ -614,6 +614,47 @@ Only use with `#![feature(...)]` at crate level AND documented reason:
 2. Test compilation on stable: `rustup default stable && cargo build`
 3. If nightly required, document in code AND update MSRV in Cargo.toml
 
+## No Panics in Library Code (Strict Enforcement)
+
+**Rule:** Library code (src/) MUST NEVER use panic!, assert!, unwrap(), expect() or any panic-inducing operation. ALL errors via Result<T, LludaError>.
+
+**Rationale:**
+- Libraries should never crash the program — let caller decide how to handle errors
+- User-provided configs/weights should produce recoverable errors, not panics
+- Found violation: Attention::new used assert! for GQA divisibility and shape checks
+- This would panic on malformed model files instead of returning proper error
+
+**Pattern - WRONG (panics):**
+```rust
+pub fn new(num_heads: usize, num_kv_heads: usize) -> Self {
+    assert!(num_heads % num_kv_heads == 0, "divisibility check");
+    // ...
+}
+```
+
+**Pattern - CORRECT (returns Result):**
+```rust
+pub fn new(num_heads: usize, num_kv_heads: usize) -> Result<Self> {
+    if num_heads % num_kv_heads != 0 {
+        return Err(LludaError::Model(format!(
+            "GQA requires num_heads ({}) divisible by num_kv_heads ({})",
+            num_heads, num_kv_heads
+        )));
+    }
+    Ok(Self { ... })
+}
+```
+
+**Exceptions:**
+- Binary/example code (examples/, tests/) MAY use unwrap() for simplicity
+- Test code MAY use assert! for test assertions
+- Internal private helper functions MAY panic IF documented and caller handles
+
+**Verification:**
+- Search codebase for: panic!, assert!, unwrap(), expect()
+- Ensure all occurrences are in test/example code only
+- Code review MUST catch any library panics
+
 ### Shape assertions at function entry:
 ```rust
 pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
