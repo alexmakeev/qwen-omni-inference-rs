@@ -957,3 +957,93 @@ Done: Applied all fixes from second Opus code review (T07-T10)
 - Updated coding standards with 3 new patterns: Config Parsing Rule, Specification Completeness, DType Preservation in Views
 
 Next: Git commit T07-T10 + fixes, continue with T11-T22 (model components)
+
+## 2026-02-01 03:59 — T11: Token Embeddings Complete
+
+**Implemented:**
+- Embedding struct with forward() lookup method
+- Input: token IDs (u32 array) + batch shape → Output: embeddings [batch_shape..., hidden_size]
+- Automatic BF16 → F32 conversion for weight lookup
+- weight() getter for tied embeddings (tie_word_embeddings=true in Qwen3)
+- Shape validation: vocab_size check, batch_shape product verification
+- Error handling: out-of-range indices, shape mismatches, non-2D weights
+
+**Specification Compliance:**
+✓ All operations from T11 spec implemented
+✓ forward(indices, batch_shape) for flexible batching
+✓ BF16 weight support with auto-conversion
+✓ weight() accessor for tied embeddings
+✓ No operations missing from specification
+
+**Testing:**
+- 11 comprehensive unit tests, all passing:
+  1. Single token lookup — verify correct row extraction
+  2. Batch lookup [3] — multiple tokens at once
+  3. 2D batch [B=2, L=3] — sequence batching
+  4. Out-of-range index — error validation
+  5. Shape mismatch — batch_shape vs indices length
+  6. BF16 weight — auto-conversion to F32 output
+  7. weight() getter — reference access for tied embeddings
+  8. All-zeros weight — edge case handling
+  9. Same token repeated — multiple lookups of same index
+  10. Empty indices — zero-length batch
+  11. Non-2D weight — error for invalid weight shape
+- Total: 219 tests passing (208 existing + 11 new)
+- Zero Clippy warnings (cargo clippy -- -D warnings passes)
+
+**Code Quality:**
+- 313 lines including comprehensive tests
+- Follows all Rust coding standards:
+  - Doc comments with runnable examples
+  - Result-based error handling (no panics)
+  - Clear error messages with context
+  - All tests inside #[cfg(test)] mod tests
+  - DType handling: BF16 weights → F32 output
+  - Broadcasting: flexible batch_shape parameter
+
+**Performance Characteristics:**
+- O(n) lookup where n = indices.len() (single pass)
+- Memory: allocates result Vec<f32> (indices.len() × hidden_size)
+- BF16 conversion overhead negligible (single to_vec_f32() call)
+- Adequate for Phase 0 validation purposes
+- PERF note: Phase 3 can optimize with gather kernel on GPU
+
+**Critical for Downstream:**
+- T19 (Full Model): Can now implement token → embedding lookup
+- T16 (Transformer): Embeddings ready for first layer input
+- Tied embeddings: weight() enables tie_word_embeddings=true (Qwen3 uses this)
+
+**Findings:**
+1. **Tied Embeddings Pattern:**
+   - Qwen3-0.6B has tie_word_embeddings=true
+   - Same weight matrix used as:
+     - Input: token ID → embedding [hidden_size]
+     - Output: hidden state → logits [vocab_size] via matmul
+   - weight() getter provides reference for LM head layer
+   - Saves 151936×1024 = 155M parameters (BF16: 310MB)
+
+2. **Batch Shape Flexibility:**
+   - Supports any batch structure: [B], [B, L], [B, H, L], etc.
+   - Output shape = batch_shape + [hidden_size]
+   - More flexible than fixed 2D [B, L] interface
+   - Critical for multi-modal batching in Phase 1
+
+3. **Error Handling Quality:**
+   - Out-of-range: "Index X out of range for vocab_size Y"
+   - Shape mismatch: expected vs actual element count
+   - Non-2D weight: clear error for invalid weight tensor
+   - All errors informative and debuggable
+
+4. **BF16 Integration:**
+   - Weights loaded as BF16 from SafeTensors
+   - Auto-converted to F32 via to_vec_f32()
+   - Zero manual conversion code (transparent)
+   - Result always F32 (consistent with compute-in-F32 principle)
+
+**Implications for Qwen3-Omni (Phase 1):**
+- Same embedding layer for text tokens
+- Audio/vision use separate projection layers (not token embeddings)
+- Multi-modal fusion happens after initial embeddings
+- Tied embeddings pattern may differ for Omni (depends on architecture)
+
+**Next:** T12 (RMSNorm) — can start immediately, dependency on element-wise ops satisfied

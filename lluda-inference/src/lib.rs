@@ -12,3 +12,9 @@ pub mod tensor;
 pub mod config;
 pub mod tokenizer;
 pub mod loader;
+
+// Model components
+pub mod embedding;
+pub mod rms_norm;
+pub mod rope;
+pub mod attention;

@@ -392,6 +392,228 @@ fn transpose_dims_preserves_bf16() {
 3. Add BF16 preservation test
 4. Verify no `.to_f32_vec()` calls in implementation
 
+## Constructor Validation Rule
+
+**Rule:** All constructors with invariants MUST validate inputs eagerly, return `Result<Self>`.
+
+**Why:** Fail-fast principle. Invalid state catches at initialization, not in forward() call.
+
+**Common violations:**
+- `Embedding`: accepts invalid vocab_size/embedding_dim
+- `RmsNorm`: accepts invalid weight shape
+- `Linear`: accepts mismatched input_dim/output_dim
+
+**Correct pattern:**
+```rust
+impl Linear {
+    pub fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
+        let weight_shape = weight.shape().dims();
+        if weight_shape.len() != 2 {
+            return Err(LludaError::ShapeMismatch {
+                expected: vec![0, 0],  // 2D required
+                got: weight_shape.to_vec(),
+            });
+        }
+
+        if let Some(ref b) = bias {
+            let bias_shape = b.shape().dims();
+            if bias_shape != &[weight_shape[0]] {
+                return Err(LludaError::ShapeMismatch {
+                    expected: vec![weight_shape[0]],
+                    got: bias_shape.to_vec(),
+                });
+            }
+        }
+
+        Ok(Self { weight, bias })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // No shape validation needed here — invariants guaranteed
+        x.matmul(&self.weight)?
+            .add(&self.bias.as_ref().unwrap())
+    }
+}
+```
+
+**Benefits:**
+- Errors occur at construction time, not during forward()
+- Stack traces point to initialization, not buried in computation
+- Invariants are guaranteed for all method calls
+
+## GQA Configuration Validation
+
+**Rule:** Group Query Attention requires `num_heads % num_kv_heads == 0`. Assert in constructor.
+
+**Why:** Silent truncation of head groups leads to incorrect attention computation.
+
+**Common violation:**
+```rust
+// BAD: num_heads=5, num_kv_heads=3
+// Silently truncates to group_size=1, losing intended GQA benefits
+impl AttentionConfig {
+    pub fn group_size(&self) -> usize {
+        self.num_heads / self.num_kv_heads  // Integer division truncates!
+    }
+}
+```
+
+**Correct pattern:**
+```rust
+impl AttentionConfig {
+    pub fn new(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        // Validate GQA invariant
+        if num_heads % num_kv_heads != 0 {
+            return Err(LludaError::Msg(format!(
+                "GQA requires num_heads ({}) divisible by num_kv_heads ({})",
+                num_heads, num_kv_heads
+            )));
+        }
+
+        Ok(Self {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+        })
+    }
+
+    pub fn group_size(&self) -> usize {
+        // Safe to use integer division — invariant guaranteed
+        self.num_heads / self.num_kv_heads
+    }
+}
+```
+
+**Testing requirement:**
+```rust
+#[test]
+fn gqa_rejects_invalid_head_counts() {
+    let result = AttentionConfig::new(5, 3, 128, 2048);
+    assert!(result.is_err(), "GQA should reject num_heads=5, num_kv_heads=3");
+}
+```
+
+## Critical Path Test Coverage
+
+**Rule:** All critical paths (masking, cache, generation) must have integration tests.
+
+**Critical paths in inference:**
+1. **Attention with mask** — causal mask, mask application to scores
+2. **KV cache accumulation** — cache grows over generation steps
+3. **Token generation loop** — sampling, cache updates, next token prediction
+
+**Common violations:**
+- Causal mask implementation untested with actual attention
+- KV cache shape/indexing never checked in full forward pass
+- Generation loop tested only in isolation, not end-to-end
+
+**Test structure:**
+```rust
+#[test]
+fn attention_with_causal_mask_generation_step() {
+    // Test that causal mask correctly zeros future tokens during generation
+    let (q, k, v) = attention_inputs_for_generation();
+
+    let mask = create_causal_mask(seq_len, past_seq_len).unwrap();
+    let masked_scores = scores.add(&mask).unwrap();  // Apply mask to scores
+
+    // Verify future tokens are masked out (softmax → near-zero attention)
+    let attn_weights = masked_scores.softmax_last_dim().unwrap();
+    for j in (seq_pos + 1)..seq_len {
+        assert!(attn_weights.index([batch, head, seq_pos, j]) < 1e-6);
+    }
+}
+
+#[test]
+fn kv_cache_accumulation_over_steps() {
+    // Simulate generation: tokens generated one at a time
+    let mut cache = KvCache::new(batch_size, max_seq_len, num_kv_heads, head_dim).unwrap();
+
+    for step in 0..5 {
+        let token_embedding = model.embed(token).unwrap();
+
+        // Forward with cache
+        let (output, new_cache) = attn_forward_with_cache(&token_embedding, &cache).unwrap();
+        cache = new_cache;
+
+        // Verify cache size grows correctly
+        assert_eq!(cache.seq_len(), step + 1);
+        assert_eq!(cache.keys().shape().dims()[1], step + 1);
+        assert_eq!(cache.values().shape().dims()[1], step + 1);
+    }
+}
+
+#[test]
+fn full_generation_loop_end_to_end() {
+    let model = load_test_model().unwrap();
+    let mut tokens = vec![BOS_TOKEN];
+
+    for _ in 0..10 {
+        let logits = model.forward(&tokens).unwrap();
+        let next_token = logits.argmax_last_dim().unwrap();
+        tokens.push(next_token);
+
+        if next_token == EOS_TOKEN {
+            break;
+        }
+    }
+
+    // Verify: generation completed, output is coherent
+    assert!(tokens.len() > 1);
+    assert!(tokens.contains(&EOS_TOKEN));
+}
+```
+
+## Stable Rust API Compliance
+
+**Rule:** Never use nightly-only APIs without feature gate. Prefer stable equivalents.
+
+**Why:** Ensures code works on stable Rust (MSRV requirement).
+
+**Common violation:**
+```rust
+// BAD: is_multiple_of() only on nightly (stabilized Rust 1.93.0+)
+if x.is_multiple_of(2) {
+    // ...
+}
+```
+
+**Stable equivalent:**
+```rust
+// GOOD: Works on stable Rust 1.56+
+if x % 2 == 0 {
+    // even
+}
+
+// GOOD: More explicit
+if x % divisor == 0 {
+    // Multiple of divisor
+}
+```
+
+**Testing for nightly API usage:**
+```bash
+# Find nightly-only method calls
+cargo build --all-targets 2>&1 | grep "stabilize"
+```
+
+**Approved nightly features (if needed):**
+Only use with `#![feature(...)]` at crate level AND documented reason:
+```rust
+#![feature(const_fn_floating_point_arithmetic)]  // Needed for compile-time constants in T09
+```
+
+**Checklist for new code:**
+1. All method calls, types, macros must exist on MSRV (Minimum Supported Rust Version)
+2. Test compilation on stable: `rustup default stable && cargo build`
+3. If nightly required, document in code AND update MSRV in Cargo.toml
+
 ### Shape assertions at function entry:
 ```rust
 pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
