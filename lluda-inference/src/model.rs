@@ -86,6 +86,7 @@ pub struct Qwen3ForCausalLM {
     /// Base Qwen3 model
     model: Qwen3Model,
     /// LM head weight (tied to embed_tokens.weight)
+    #[allow(dead_code)]
     lm_head_weight: Tensor,
     /// Pre-transposed LM head weight for efficient matmul: [hidden_size, vocab_size]
     lm_head_weight_transposed: Tensor,
@@ -191,6 +192,42 @@ impl Qwen3Model {
 
         // 4. Final normalization
         self.norm.forward(&hidden_states)
+    }
+
+    /// Forward pass with intermediate layer outputs exposed (for validation).
+    ///
+    /// Returns (embedding_output, layer_outputs, final_norm_output).
+    #[allow(dead_code)]
+    pub(crate) fn forward_with_intermediates(
+        &mut self,
+        input_ids: &[u32],
+        batch_size: usize,
+        seq_len: usize,
+        offset: usize,
+    ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
+        // 1. Embed tokens: [B, L] -> [B, L, hidden_size]
+        let mut hidden_states = self.embed_tokens.forward(input_ids, &[batch_size, seq_len])?;
+        let embedding_output = hidden_states.clone();
+
+        // 2. Generate causal mask (if seq_len > 1)
+        let mask = causal_mask(batch_size, seq_len, offset, DType::F32)?;
+
+        // 3. Pass through all transformer layers, saving each output
+        let mut layer_outputs = Vec::with_capacity(self.layers.len());
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.forward(
+                &hidden_states,
+                mask.as_ref(),
+                &mut self.kv_caches[layer_idx],
+                offset,
+            )?;
+            layer_outputs.push(hidden_states.clone());
+        }
+
+        // 4. Final normalization
+        let final_norm_output = self.norm.forward(&hidden_states)?;
+
+        Ok((embedding_output, layer_outputs, final_norm_output))
     }
 
     /// Clear all KV caches.
@@ -358,6 +395,32 @@ impl Qwen3ForCausalLM {
     /// ```
     pub fn clear_kv_cache(&mut self) {
         self.model.clear_kv_cache();
+    }
+
+    /// Forward pass with intermediate layer outputs (for validation/debugging).
+    ///
+    /// Returns (embedding_output, layer_outputs, final_norm_output).
+    ///
+    /// # Note
+    ///
+    /// This method is primarily for validation and debugging. It clones intermediate
+    /// tensors which adds memory overhead.
+    #[doc(hidden)]
+    pub fn forward_with_intermediates(
+        &mut self,
+        input_ids: &[u32],
+    ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
+        let batch_size = 1;
+        let seq_len = input_ids.len();
+        let offset = 0;
+
+        self.model.forward_with_intermediates(input_ids, batch_size, seq_len, offset)
+    }
+
+    /// Get reference to LM head weight (for validation).
+    #[doc(hidden)]
+    pub fn lm_head_weight_transposed(&self) -> &Tensor {
+        &self.lm_head_weight_transposed
     }
 }
 

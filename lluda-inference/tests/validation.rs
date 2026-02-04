@@ -414,6 +414,209 @@ mod tests {
         assert!(formatted.contains("Logits"));
     }
 
+    /// Layer-by-layer validation for debugging multi-token divergence.
+    ///
+    /// This test validates each intermediate layer output against Python reference.
+    /// Helps identify where divergence starts in multi-token sequences.
+    #[test]
+    fn test_layer_by_layer_validation() {
+        use lluda_inference::config::Qwen3Config;
+        use lluda_inference::loader::ModelWeights;
+        use lluda_inference::model::Qwen3ForCausalLM;
+
+        // Find reference data directory
+        let ref_dir = match find_reference_dir() {
+            Some(dir) => dir,
+            None => {
+                eprintln!("Skipping validation test: reference_data directory not found");
+                return;
+            }
+        };
+
+        // Use prompt2 (5 tokens) for debugging multi-token divergence
+        let prompt_dir = ref_dir.join("prompt2");
+        if !prompt_dir.exists() {
+            eprintln!("Skipping: prompt2 directory not found");
+            return;
+        }
+
+        eprintln!("\n=== Layer-by-Layer Validation (prompt2) ===\n");
+
+        // Load input_ids
+        let input_ids_path = prompt_dir.join("input_ids.npy");
+        if !input_ids_path.exists() {
+            eprintln!("Skipping: input_ids.npy not found");
+            return;
+        }
+
+        let input_ids_ref = load_npy_i64_dyn(&input_ids_path).expect("Failed to load input_ids");
+        let input_ids: Vec<u32> = input_ids_ref.iter().map(|&x| x as u32).collect();
+        eprintln!("Input IDs: {:?} (length={})", input_ids, input_ids.len());
+
+        // Load model
+        let model_dir = PathBuf::from("../models/Qwen3-0.6B");
+        if !model_dir.exists() {
+            eprintln!("Skipping: model directory not found");
+            return;
+        }
+
+        let config_path = model_dir.join("config.json");
+        let weights_path = model_dir.join("model.safetensors");
+
+        let config = match Qwen3Config::from_file(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping: failed to load config: {}", e);
+                return;
+            }
+        };
+
+        let weights = match ModelWeights::from_safetensors(&weights_path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Skipping: failed to load weights: {}", e);
+                return;
+            }
+        };
+
+        let mut model = match Qwen3ForCausalLM::load(&config, &weights) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Skipping: failed to load model: {}", e);
+                return;
+            }
+        };
+
+        // Run forward pass with intermediates
+        eprintln!("Running forward pass with intermediate capture...");
+        let seq_len = input_ids.len();
+
+        let (embedding_output, layer_outputs, final_norm_output) =
+            model.forward_with_intermediates(&input_ids)
+                .expect("Forward pass failed");
+
+        eprintln!("Forward pass complete. Validating against reference data...\n");
+
+        let mut report = ValidationReport::new();
+        let mut first_failure_layer: Option<usize> = None;
+
+        // 1. Validate embedding output
+        let embedding_ref_path = prompt_dir.join("embedding_output.npy");
+        if embedding_ref_path.exists() {
+            let ref_arr = load_npy_dyn(&embedding_ref_path).expect("Failed to load embedding_output.npy");
+            let (ref_vec, _) = ref_arr.into_raw_vec_and_offset();
+            let rust_vec: Vec<f32> = embedding_output.to_vec_f32();
+
+            let metrics = compute_validation_metrics(&rust_vec, &ref_vec, 0);
+            eprintln!("Embedding: {}", metrics.format());
+            report.embedding = Some(metrics.clone());
+
+            if !metrics.is_valid(1e-5, 0.999, 1e-3) {
+                eprintln!("  ⚠ EMBEDDING DIVERGENCE DETECTED");
+                first_failure_layer = Some(0);
+            }
+        }
+
+        // 2. Validate each layer output
+        eprintln!("\nTransformer Layers:");
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer_ref_path = prompt_dir.join(format!("layer_{:02}_output.npy", layer_idx));
+            if !layer_ref_path.exists() {
+                continue;
+            }
+
+            let ref_arr = load_npy_dyn(&layer_ref_path)
+                .unwrap_or_else(|_| panic!("Failed to load layer_{:02}_output.npy", layer_idx));
+            let (ref_vec, _) = ref_arr.into_raw_vec_and_offset();
+
+            let rust_vec = layer_outputs[layer_idx].to_vec_f32();
+
+            let metrics = compute_validation_metrics(&rust_vec, &ref_vec, layer_idx);
+            let is_valid = metrics.is_valid(1e-4, 0.999, 1e-3);
+            let status = if is_valid { "✓" } else { "✗" };
+
+            eprintln!("  {} {}", status, metrics.format());
+            report.layers.push(metrics.clone());
+
+            if !is_valid && first_failure_layer.is_none() {
+                first_failure_layer = Some(layer_idx + 1);
+                eprintln!("    ⚠ FIRST DIVERGENCE DETECTED AT LAYER {}", layer_idx);
+            }
+        }
+
+        // 3. Validate final norm
+        let final_norm_ref_path = prompt_dir.join("final_norm_output.npy");
+        if final_norm_ref_path.exists() {
+            let ref_arr = load_npy_dyn(&final_norm_ref_path).expect("Failed to load final_norm_output.npy");
+            let (ref_vec, _) = ref_arr.into_raw_vec_and_offset();
+            let rust_vec: Vec<f32> = final_norm_output.to_vec_f32();
+
+            let metrics = compute_validation_metrics(&rust_vec, &ref_vec, 999);
+            eprintln!("\nFinal Norm: {}", metrics.format());
+            report.final_norm = Some(metrics);
+        }
+
+        // 4. Validate logits (compute from final_norm_output)
+        let logits_ref_path = prompt_dir.join("logits.npy");
+        if logits_ref_path.exists() {
+            // Get last token from final_norm_output
+            let batch_size = 1;
+            let last_hidden = final_norm_output.narrow(1, seq_len - 1, 1).expect("Failed to narrow");
+            let last_hidden_2d = last_hidden.reshape(&[batch_size, last_hidden.shape()[2]]).expect("Failed to reshape");
+            let logits_2d = last_hidden_2d.matmul(model.lm_head_weight_transposed()).expect("Matmul failed");
+            let rust_logits_vec = logits_2d.to_vec_f32();
+
+            let ref_logits_arr = load_npy_dyn(&logits_ref_path).expect("Failed to load logits.npy");
+            let ref_shape = ref_logits_arr.shape();
+            let vocab_size = ref_shape[2];
+            let (ref_logits_vec, _) = ref_logits_arr.into_raw_vec_and_offset();
+            let ref_logits_last = &ref_logits_vec[(seq_len - 1) * vocab_size..];
+
+            let metrics = compute_validation_metrics(&rust_logits_vec, ref_logits_last, 1000);
+            eprintln!("Logits: {}", metrics.format());
+            report.logits = Some(metrics);
+        }
+
+        // 5. Check generated token match
+        let generated_ids_path = prompt_dir.join("generated_ids.npy");
+        if generated_ids_path.exists() {
+            let gen_ids_ref = load_npy_i64_dyn(&generated_ids_path).expect("Failed to load generated_ids.npy");
+            let gen_ids_vec: Vec<i64> = gen_ids_ref.iter().copied().collect();
+
+            // First generated token is at position seq_len
+            if gen_ids_vec.len() > seq_len {
+                let expected_token = gen_ids_vec[seq_len] as u32;
+
+                // Get argmax from our logits
+                if let Some(ref logits_metrics) = report.logits {
+                    eprintln!("\nGenerated token comparison:");
+                    eprintln!("  Expected next token: {}", expected_token);
+                    // Token comparison would need actual logits, skip for now
+                }
+            }
+        }
+
+        // Summary
+        eprintln!("\n{}", "=".repeat(80));
+        if let Some(layer) = first_failure_layer {
+            if layer == 0 {
+                eprintln!("DIAGNOSIS: Divergence starts at EMBEDDING layer");
+                eprintln!("  → Check: Token embedding lookup");
+            } else {
+                eprintln!("DIAGNOSIS: Divergence starts at LAYER {}", layer - 1);
+                eprintln!("  → Check this layer's components:");
+                eprintln!("    - Input normalization");
+                eprintln!("    - Attention (Q/K/V projections, RoPE, softmax)");
+                eprintln!("    - Post-attention normalization");
+                eprintln!("    - MLP (gate/up/down projections, SiLU activation)");
+                eprintln!("    - Residual connections");
+            }
+        } else {
+            eprintln!("All layers match reference within tolerance!");
+        }
+        eprintln!("{}", "=".repeat(80));
+    }
+
     /// Integration test: validate against Python reference (if available).
     ///
     /// This test requires:
