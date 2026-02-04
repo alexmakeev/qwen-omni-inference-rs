@@ -121,30 +121,40 @@ def extract_activations(
     print(f"final_norm_output shape: {final_norm_output.shape}")
 
     # Extract RoPE cos/sin tables
-    # For Qwen3, RoPE is in model.layers[0].self_attn.rotary_emb
-    print("Extracting RoPE cos/sin tables...")
-    rotary_emb = model.model.layers[0].self_attn.rotary_emb
-
-    # Generate cos/sin for full max_position_embeddings range
+    # Compute manually using config parameters to match Rust implementation
+    print("Computing RoPE cos/sin tables...")
     max_seq_len = model.config.max_position_embeddings
     head_dim = model.config.hidden_size // model.config.num_attention_heads
+    rope_theta = getattr(model.config, 'rope_theta', 1000000.0)
 
-    # Create position indices
-    position_ids = torch.arange(max_seq_len, dtype=torch.long).unsqueeze(0)
+    print(f"RoPE config: max_seq_len={max_seq_len}, head_dim={head_dim}, theta={rope_theta}")
 
-    # Get cos/sin from rotary embedding
-    # This calls the forward method which computes cos/sin
-    cos, sin = rotary_emb(
-        torch.zeros(1, max_seq_len, head_dim),  # Dummy tensor for shape
-        position_ids
-    )
+    # Compute inverse frequencies: inv_freq[i] = 1.0 / (theta^(2*i / head_dim))
+    # Shape: [head_dim // 2]
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
 
-    # Convert to float32 and numpy
-    rope_cos = cos.to(torch.float32).numpy()
-    rope_sin = sin.to(torch.float32).numpy()
+    # Create position indices: [0, 1, 2, ..., max_seq_len-1]
+    # Shape: [max_seq_len]
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
 
-    activations["rope_cos"] = rope_cos
-    activations["rope_sin"] = rope_sin
+    # Compute outer product: positions[:, None] * inv_freq[None, :]
+    # Shape: [max_seq_len, head_dim // 2]
+    freqs = torch.outer(positions, inv_freq)
+
+    # Compute cos and sin tables
+    # Shape: [max_seq_len, head_dim // 2]
+    cos_half = torch.cos(freqs)
+    sin_half = torch.sin(freqs)
+
+    # Interleave to get full head_dim: [cos0, cos0, cos1, cos1, ...]
+    # This matches the RoPE application pattern where pairs of dimensions share the same angle
+    # Shape: [max_seq_len, head_dim]
+    rope_cos = torch.stack([cos_half, cos_half], dim=-1).reshape(max_seq_len, head_dim)
+    rope_sin = torch.stack([sin_half, sin_half], dim=-1).reshape(max_seq_len, head_dim)
+
+    # Convert to numpy
+    activations["rope_cos"] = rope_cos.numpy()
+    activations["rope_sin"] = rope_sin.numpy()
     print(f"RoPE cos shape: {rope_cos.shape}, sin shape: {rope_sin.shape}")
 
     # Greedy generation (deterministic)
