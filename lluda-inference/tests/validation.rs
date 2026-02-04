@@ -202,6 +202,28 @@ fn load_npy_dyn(path: &Path) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> 
     Ok(ArrayD::read_npy(reader)?)
 }
 
+/// Load a .npy file as a 1D i64 array (for input_ids).
+#[allow(dead_code)]
+fn load_npy_i64_1d(path: &Path) -> Result<Array1<i64>, Box<dyn std::error::Error>> {
+    let reader = File::open(path)?;
+    let array: ArrayD<i64> = ArrayD::read_npy(reader)?;
+    Ok(array.into_dimensionality::<ndarray::Ix1>()?)
+}
+
+/// Load a .npy file as a 2D i64 array (for input_ids with batch dimension).
+#[allow(dead_code)]
+fn load_npy_i64_2d(path: &Path) -> Result<Array2<i64>, Box<dyn std::error::Error>> {
+    let reader = File::open(path)?;
+    let array: ArrayD<i64> = ArrayD::read_npy(reader)?;
+    Ok(array.into_dimensionality::<ndarray::Ix2>()?)
+}
+
+/// Load a .npy file as a dynamic-dimensional i64 array (for input_ids).
+fn load_npy_i64_dyn(path: &Path) -> Result<ArrayD<i64>, Box<dyn std::error::Error>> {
+    let reader = File::open(path)?;
+    Ok(ArrayD::read_npy(reader)?)
+}
+
 /// Compute validation metrics comparing two flat f32 slices.
 fn compute_validation_metrics(
     predicted: &[f32],
@@ -350,7 +372,7 @@ mod tests {
             return;
         }
 
-        let input_ids = load_npy_dyn(&input_ids_path).expect("Failed to load input_ids.npy");
+        let input_ids = load_npy_i64_dyn(&input_ids_path).expect("Failed to load input_ids.npy");
         eprintln!("Loaded input_ids.npy: shape={:?}", input_ids.shape());
 
         // Verify basic properties
@@ -438,13 +460,13 @@ mod tests {
             return;
         }
 
-        // Load input_ids
-        let input_ids_ref = load_npy_dyn(&input_ids_path).expect("Failed to load input_ids");
+        // Load input_ids (i64 array from Python)
+        let input_ids_ref = load_npy_i64_dyn(&input_ids_path).expect("Failed to load input_ids");
         let input_ids: Vec<u32> = input_ids_ref.iter().map(|&x| x as u32).collect();
         eprintln!("Input IDs: {:?}", input_ids);
 
         // Check if model exists
-        let model_dir = PathBuf::from("models/Qwen3-0.6B");
+        let model_dir = PathBuf::from("../models/Qwen3-0.6B");
         if !model_dir.exists() {
             eprintln!("Skipping: model directory not found at {}", model_dir.display());
             return;
