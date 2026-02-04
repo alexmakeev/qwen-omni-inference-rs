@@ -87,6 +87,8 @@ pub struct Qwen3ForCausalLM {
     model: Qwen3Model,
     /// LM head weight (tied to embed_tokens.weight)
     lm_head_weight: Tensor,
+    /// Pre-transposed LM head weight for efficient matmul: [hidden_size, vocab_size]
+    lm_head_weight_transposed: Tensor,
 }
 
 impl Qwen3Model {
@@ -251,9 +253,14 @@ impl Qwen3ForCausalLM {
                 .clone()
         };
 
+        // Pre-transpose LM head weight: [vocab_size, hidden_size] -> [hidden_size, vocab_size]
+        // This is expensive but we only do it once during model loading
+        let lm_head_weight_transposed = lm_head_weight.transpose_dims(0, 1)?;
+
         Ok(Qwen3ForCausalLM {
             model,
             lm_head_weight,
+            lm_head_weight_transposed,
         })
     }
 
@@ -314,9 +321,15 @@ impl Qwen3ForCausalLM {
         let last_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
 
         // Project to vocabulary: [B, 1, hidden_size] @ [hidden_size, vocab_size]
-        // lm_head_weight is [vocab_size, hidden_size], so we need to transpose
-        let lm_head_transposed = self.lm_head_weight.transpose_dims(0, 1)?;
-        let logits = last_hidden.matmul(&lm_head_transposed)?;
+        // Reshape last_hidden to 2D: [B*1, hidden_size] = [1, hidden_size]
+        let last_hidden_2d = last_hidden.reshape(&[batch_size, last_hidden.shape()[2]])?;
+
+        // lm_head_weight_transposed is [hidden_size, vocab_size]
+        // Compute: [1, hidden_size] @ [hidden_size, vocab_size] -> [1, vocab_size]
+        let logits_2d = last_hidden_2d.matmul(&self.lm_head_weight_transposed)?;
+
+        // Reshape back to [B, 1, vocab_size]
+        let logits = logits_2d.reshape(&[batch_size, 1, logits_2d.shape()[1]])?;
 
         Ok(logits)
     }

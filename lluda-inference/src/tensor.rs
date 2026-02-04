@@ -462,13 +462,20 @@ impl Tensor {
             return Ok(self.clone());
         }
 
-        let data = self.to_vec_f32();
         let ndim = self.ndim();
         let original_dtype = self.dtype();
 
         // Build new shape with swapped dimensions
         let mut new_shape = self.shape.clone();
         new_shape.swap(dim0, dim1);
+
+        // OPTIMIZATION: For 2D matrices transposing dims (0,1), use fast path
+        if ndim == 2 && ((dim0 == 0 && dim1 == 1) || (dim0 == 1 && dim1 == 0)) {
+            return self.transpose_2d_fast(original_dtype, new_shape);
+        }
+
+        // General case: slower multi-dimensional transpose
+        let data = self.to_vec_f32();
 
         // Compute destination strides
         let dst_strides = compute_strides(&new_shape);
@@ -513,6 +520,48 @@ impl Tensor {
         // Preserve original dtype
         let transposed = Tensor::new(result, new_shape)?;
         transposed.to_dtype(original_dtype)
+    }
+
+    /// Fast path for 2D matrix transpose.
+    ///
+    /// Optimized for row-major to column-major (and vice versa) conversion.
+    /// Much faster than the general transpose_dims for large matrices.
+    fn transpose_2d_fast(&self, original_dtype: DType, new_shape: Vec<usize>) -> Result<Tensor> {
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+
+        // For BF16, work directly with BF16 data (avoid F32 conversion)
+        match &self.data {
+            TensorData::BF16(data) => {
+                let mut result = vec![BF16::from(0.0f32); data.len()];
+
+                // Transpose: result[j, i] = data[i, j]
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let src_idx = i * cols + j;
+                        let dst_idx = j * rows + i;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+
+                Tensor::from_bf16(result, new_shape)
+            }
+            TensorData::F32(data) => {
+                let mut result = vec![0.0f32; data.len()];
+
+                // Transpose: result[j, i] = data[i, j]
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let src_idx = i * cols + j;
+                        let dst_idx = j * rows + i;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+
+                let transposed = Tensor::new(result, new_shape)?;
+                transposed.to_dtype(original_dtype)
+            }
+        }
     }
 
     /// Remove dimensions of size 1 from the tensor shape.
