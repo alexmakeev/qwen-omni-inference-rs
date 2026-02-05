@@ -54,6 +54,13 @@ impl BF16 {
         BF16(bits)
     }
 
+    /// Get the raw bits representation.
+    ///
+    /// This is useful for serialization and GPU buffer conversions.
+    pub fn to_bits(self) -> u16 {
+        self.0
+    }
+
     /// Convert a slice of BF16 values to F32 for computation.
     ///
     /// This is a batch operation optimized for tensor weight loading.

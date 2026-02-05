@@ -16,6 +16,8 @@
 //! println!("GPU adapter: {}", ctx.adapter_info().name);
 //! ```
 
+pub mod buffer;
+
 use crate::error::{LludaError, Result};
 use wgpu;
 

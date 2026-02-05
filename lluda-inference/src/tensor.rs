@@ -37,6 +37,9 @@
 use crate::bf16::BF16;
 use crate::error::{LludaError, Result};
 
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
+
 /// Tensor data type.
 ///
 /// Specifies how tensor data is stored in memory.
@@ -66,6 +69,12 @@ enum TensorData {
     BF16(Vec<BF16>),
     /// F32 storage (for activations and compute results)
     F32(Vec<f32>),
+    /// GPU buffer storage (when gpu feature is enabled)
+    #[cfg(feature = "gpu")]
+    GpuBuffer {
+        buffer: Arc<wgpu::Buffer>,
+        dtype: DType,
+    },
 }
 
 impl TensorData {
@@ -74,6 +83,8 @@ impl TensorData {
         match self {
             TensorData::BF16(_) => DType::BF16,
             TensorData::F32(_) => DType::F32,
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { dtype, .. } => *dtype,
         }
     }
 }
@@ -302,6 +313,10 @@ impl Tensor {
         match &self.data {
             TensorData::F32(v) => v.clone(),
             TensorData::BF16(v) => BF16::to_f32_slice(v),
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                panic!("Cannot extract F32 data from GPU buffer. Use to_cpu() first.")
+            }
         }
     }
 
@@ -351,6 +366,12 @@ impl Tensor {
         match &self.data {
             TensorData::F32(data) => Tensor::new(data.clone(), new_shape.to_vec()),
             TensorData::BF16(data) => Tensor::from_bf16(data.clone(), new_shape.to_vec()),
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                return Err(LludaError::Msg(
+                    "Cannot reshape GPU buffer. Use to_cpu() first.".to_string(),
+                ))
+            }
         }
     }
 
@@ -560,6 +581,12 @@ impl Tensor {
 
                 let transposed = Tensor::new(result, new_shape)?;
                 transposed.to_dtype(original_dtype)
+            }
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                Err(LludaError::Msg(
+                    "Cannot transpose GPU buffer. Use to_cpu() first.".to_string(),
+                ))
             }
         }
     }
@@ -2393,6 +2420,158 @@ fn matmul_4d(
     }
 
     Tensor::new(result, vec![batch, heads, m, n])
+}
+
+// ========== GPU Operations (Conditional Compilation) ==========
+
+#[cfg(feature = "gpu")]
+impl Tensor {
+    /// Upload tensor data from CPU to GPU.
+    ///
+    /// Creates a new tensor with data stored in GPU memory. The tensor's shape
+    /// and dtype are preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - GPU context with device and queue
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Tensor is already on GPU
+    /// - GPU upload fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::tensor::Tensor;
+    /// use lluda_inference::gpu;
+    ///
+    /// let ctx = gpu::init().unwrap();
+    /// let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+    /// let gpu_t = t.to_gpu(&ctx).unwrap();
+    /// assert!(gpu_t.is_on_gpu());
+    /// ```
+    pub fn to_gpu(&self, ctx: &crate::gpu::GpuContext) -> Result<Tensor> {
+        if self.is_on_gpu() {
+            return Err(LludaError::Msg("Tensor is already on GPU".to_string()));
+        }
+
+        let gpu_buffer = match &self.data {
+            TensorData::BF16(data) => {
+                let buffer = crate::gpu::buffer::GpuTensorBuffer::from_cpu_bf16(
+                    ctx,
+                    data,
+                    &self.shape,
+                )?;
+                TensorData::GpuBuffer {
+                    buffer: buffer.buffer(),
+                    dtype: DType::BF16,
+                }
+            }
+            TensorData::F32(data) => {
+                let buffer =
+                    crate::gpu::buffer::GpuTensorBuffer::from_cpu_f32(ctx, data, &self.shape)?;
+                TensorData::GpuBuffer {
+                    buffer: buffer.buffer(),
+                    dtype: DType::F32,
+                }
+            }
+            TensorData::GpuBuffer { .. } => {
+                return Err(LludaError::Msg("Tensor is already on GPU".to_string()));
+            }
+        };
+
+        Ok(Tensor {
+            data: gpu_buffer,
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+        })
+    }
+
+    /// Download tensor data from GPU to CPU.
+    ///
+    /// Creates a new tensor with data stored in CPU memory. The tensor's shape
+    /// is preserved. The data type (BF16 or F32) is preserved from the GPU buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Tensor is not on GPU
+    /// - GPU download fails
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::tensor::Tensor;
+    /// use lluda_inference::gpu;
+    ///
+    /// let ctx = gpu::init().unwrap();
+    /// let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+    /// let gpu_t = t.to_gpu(&ctx).unwrap();
+    /// let cpu_t = gpu_t.to_cpu(&ctx).unwrap();
+    /// assert!(!cpu_t.is_on_gpu());
+    /// ```
+    pub fn to_cpu(&self, ctx: &crate::gpu::GpuContext) -> Result<Tensor> {
+        match &self.data {
+            TensorData::GpuBuffer { buffer, dtype } => {
+                // Calculate buffer size from tensor shape and dtype
+                let num_elements: usize = self.shape.iter().product();
+                let size = match dtype {
+                    DType::BF16 => num_elements * 2,
+                    DType::F32 => num_elements * 4,
+                };
+
+                // Reconstruct GpuTensorBuffer from Arc<Buffer>
+                let gpu_buffer = crate::gpu::buffer::GpuTensorBuffer::from_arc_buffer(
+                    Arc::clone(buffer),
+                    size,
+                    *dtype,
+                );
+
+                let cpu_data = match dtype {
+                    DType::BF16 => {
+                        let bf16_data = gpu_buffer.to_cpu_bf16(ctx)?;
+                        TensorData::BF16(bf16_data)
+                    }
+                    DType::F32 => {
+                        let f32_data = gpu_buffer.to_cpu_f32(ctx)?;
+                        TensorData::F32(f32_data)
+                    }
+                };
+
+                Ok(Tensor {
+                    data: cpu_data,
+                    shape: self.shape.clone(),
+                    strides: self.strides.clone(),
+                })
+            }
+            _ => Err(LludaError::Msg(
+                "Tensor is not on GPU, cannot download".to_string(),
+            )),
+        }
+    }
+
+    /// Check if tensor data is stored on GPU.
+    ///
+    /// Returns `true` if the tensor's data is in GPU memory, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::tensor::Tensor;
+    /// use lluda_inference::gpu;
+    ///
+    /// let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+    /// assert!(!t.is_on_gpu()); // CPU tensor
+    ///
+    /// let ctx = gpu::init().unwrap();
+    /// let gpu_t = t.to_gpu(&ctx).unwrap();
+    /// assert!(gpu_t.is_on_gpu()); // GPU tensor
+    /// ```
+    pub fn is_on_gpu(&self) -> bool {
+        matches!(self.data, TensorData::GpuBuffer { .. })
+    }
 }
 
 #[cfg(test)]
@@ -4479,5 +4658,185 @@ mod tests {
             "Index should be valid (0-2), got {}",
             idx
         );
+    }
+
+    // ========== GPU Tests ==========
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_to_gpu_bf16() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        // Create BF16 tensor
+        let data = vec![1.0, 2.5, -3.75, 0.0, 100.5, -200.25];
+        let t = Tensor::new(data.clone(), vec![2, 3])
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // Upload to GPU
+        let gpu_t = t.to_gpu(&ctx).expect("Failed to upload to GPU");
+        assert!(gpu_t.is_on_gpu());
+        assert_eq!(gpu_t.dtype(), DType::BF16);
+        assert_eq!(gpu_t.shape(), &[2, 3]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_to_gpu_f32() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        // Create F32 tensor
+        let data = vec![1.0, 2.5, -3.75, 0.0];
+        let t = Tensor::new(data.clone(), vec![2, 2]).unwrap();
+
+        // Upload to GPU
+        let gpu_t = t.to_gpu(&ctx).expect("Failed to upload to GPU");
+        assert!(gpu_t.is_on_gpu());
+        assert_eq!(gpu_t.dtype(), DType::F32);
+        assert_eq!(gpu_t.shape(), &[2, 2]);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_gpu_roundtrip_bf16() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        // Create BF16 tensor with test data
+        let data = vec![1.0, 2.5, -3.75, 0.0];
+        let t = Tensor::new(data.clone(), vec![2, 2])
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        // Upload to GPU
+        let gpu_t = t.to_gpu(&ctx).expect("Failed to upload to GPU");
+        assert!(gpu_t.is_on_gpu());
+
+        // Download back to CPU
+        let cpu_t = gpu_t.to_cpu(&ctx).expect("Failed to download from GPU");
+        assert!(!cpu_t.is_on_gpu());
+        assert_eq!(cpu_t.dtype(), DType::BF16);
+        assert_eq!(cpu_t.shape(), &[2, 2]);
+
+        // Verify data is preserved (accounting for BF16 precision loss)
+        let original_f32 = t.to_vec_f32();
+        let roundtrip_f32 = cpu_t.to_vec_f32();
+        assert_eq!(original_f32.len(), roundtrip_f32.len());
+
+        for (orig, rt) in original_f32.iter().zip(roundtrip_f32.iter()) {
+            // BF16 has limited precision, so use approximate equality
+            let diff = (orig - rt).abs();
+            assert!(
+                diff < 0.01,
+                "Value mismatch: original={}, roundtrip={}, diff={}",
+                orig,
+                rt,
+                diff
+            );
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_gpu_roundtrip_f32() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        // Create F32 tensor with test data
+        let data = vec![1.0, 2.5, -3.75, 0.0, 100.5, -200.25];
+        let t = Tensor::new(data.clone(), vec![2, 3]).unwrap();
+
+        // Upload to GPU
+        let gpu_t = t.to_gpu(&ctx).expect("Failed to upload to GPU");
+        assert!(gpu_t.is_on_gpu());
+
+        // Download back to CPU
+        let cpu_t = gpu_t.to_cpu(&ctx).expect("Failed to download from GPU");
+        assert!(!cpu_t.is_on_gpu());
+        assert_eq!(cpu_t.dtype(), DType::F32);
+        assert_eq!(cpu_t.shape(), &[2, 3]);
+
+        // Verify data is exactly preserved (F32 precision)
+        let original_f32 = t.to_vec_f32();
+        let roundtrip_f32 = cpu_t.to_vec_f32();
+        assert_eq!(original_f32, roundtrip_f32);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_double_upload_error() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        let t = Tensor::new(vec![1.0, 2.0], vec![2]).unwrap();
+        let gpu_t = t.to_gpu(&ctx).unwrap();
+
+        // Trying to upload again should fail
+        let result = gpu_t.to_gpu(&ctx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already on GPU"));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_tensor_download_non_gpu_error() {
+        use crate::gpu;
+
+        let ctx = match gpu::init() {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                println!("Skipping GPU test: No GPU available");
+                return;
+            }
+        };
+
+        let t = Tensor::new(vec![1.0, 2.0], vec![2]).unwrap();
+
+        // Trying to download CPU tensor should fail
+        let result = t.to_cpu(&ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not on GPU"));
     }
 }
