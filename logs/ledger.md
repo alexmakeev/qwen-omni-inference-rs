@@ -1120,3 +1120,45 @@ Time: ~8 hours autonomous work
 Status: ✅ PHASE 0 COMPLETE AND VALIDATED
 
 Next: Phase 1 (GPU acceleration via wgpu/Vulkan, Qwen3-Omni multimodal)
+
+## 2026-02-05 01:21
+--- COMPACTING (auto) ---
+## 2026-02-05 01:28
+Done: Phase 1 architecture plan completed - GPU acceleration GEMV-first approach
+Decision: GPU BEFORE quantization (UMA advantages, 5-10x expected speedup)
+Strategy: Incremental wgpu integration, feature-flagged, CPU fallback preserved
+Next: T23 - wgpu setup and device initialization
+
+Tasks planned: T23-T30 (15-25h estimated)
+
+## 2026-02-05 01:35
+Done: T23 complete - wgpu infrastructure setup
+Commit: 17f720a - GPU init with GpuContext, 335 tests passing
+Next: T24 - GPU buffer abstraction for Tensor
+
+## 2026-02-05 01:43
+Done: T24 complete - GPU buffer abstraction
+Commit: 62f4d4a - CPU/GPU transfers, 345 tests passing
+Next: T25 - GEMV compute shader (WGSL)
+
+## 2026-02-05 01:54
+Done: T25 complete - GEMV compute shader
+Commit: 1edf3aa - WGSL shader, pipeline, tests passing
+Next: T26 - Integrate GEMV into Tensor::matmul()
+Goal: Benchmark CPU vs GPU tokens/sec on Luda + quality comparison
+
+## 2026-02-05 02:04
+Done: T26 complete - GEMV integrated into matmul()
+Commit: 14130ac - Auto GPU dispatch, 349 tests passing
+Next: Create full inference benchmark for CPU vs GPU tokens/sec on Luda
+
+## 2026-02-05 02:40
+Done: Benchmark CPU vs GPU on Luda complete
+Results:
+- CPU: 0.21 tok/s (4862ms per token)
+- GPU: 0.20 tok/s (4888ms per token)
+- Quality: IDENTICAL (100% match)
+
+Analysis: GPU no speedup due to GEMV-only acceleration
+Next: Full GPU pipeline (T27-T29) or quantization for real gains
+
