@@ -253,26 +253,218 @@ impl GemvPipeline {
     }
 }
 
+/// High-level wrapper for GEMV operation: output = matrix × vector
+///
+/// This function handles BF16 tensor data upload, GPU computation, and result download.
+/// Used for accelerating Linear layer forward passes (matrix-vector multiplication).
+///
+/// # Arguments
+///
+/// * `ctx` - GPU context
+/// * `matrix` - Matrix tensor (M×N), must be BF16
+/// * `vector` - Vector tensor (N×1 or N), must be BF16
+///
+/// # Returns
+///
+/// Output tensor (M×1 or M), BF16 dtype
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Shapes are incompatible (matrix cols != vector length)
+/// - Data types are not BF16
+/// - GPU buffer operations fail
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lluda_inference::gpu::{get_context, gemv::gemv_forward};
+/// use lluda_inference::tensor::Tensor;
+/// use lluda_inference::bf16::BF16;
+///
+/// let ctx = get_context().unwrap();
+///
+/// // Create matrix (2×3) and vector (3×1)
+/// let matrix = Tensor::from_bf16(vec![BF16::from(1.0); 6], vec![2, 3]).unwrap();
+/// let vector = Tensor::from_bf16(vec![BF16::from(1.0); 3], vec![3]).unwrap();
+///
+/// let result = gemv_forward(ctx, &matrix, &vector).unwrap();
+/// // result shape: [2]
+/// ```
+pub fn gemv_forward(
+    ctx: &GpuContext,
+    matrix: &crate::tensor::Tensor,
+    vector: &crate::tensor::Tensor,
+) -> Result<crate::tensor::Tensor> {
+    use crate::bf16::BF16;
+    use crate::tensor::DType;
+
+    // Validate shapes
+    let matrix_shape = matrix.shape();
+    let vector_shape = vector.shape();
+
+    // Matrix must be 2D (M×N)
+    if matrix_shape.len() != 2 {
+        return Err(LludaError::Msg(format!(
+            "GEMV: matrix must be 2D, got shape {:?}",
+            matrix_shape
+        )));
+    }
+
+    // Vector must be 1D (N) or 2D (N×1)
+    let n = if vector_shape.len() == 1 || (vector_shape.len() == 2 && vector_shape[1] == 1) {
+        vector_shape[0]
+    } else {
+        return Err(LludaError::Msg(format!(
+            "GEMV: vector must be 1D (N) or 2D (N×1), got shape {:?}",
+            vector_shape
+        )));
+    };
+
+    let m = matrix_shape[0];
+    let k = matrix_shape[1];
+
+    // Validate inner dimensions
+    if k != n {
+        return Err(LludaError::Msg(format!(
+            "GEMV: shape mismatch: matrix {}×{}, vector length {}",
+            m, k, n
+        )));
+    }
+
+    // Both tensors must be BF16
+    if matrix.dtype() != DType::BF16 || vector.dtype() != DType::BF16 {
+        return Err(LludaError::Msg(format!(
+            "GEMV: requires BF16 tensors, got matrix={}, vector={}",
+            matrix.dtype(),
+            vector.dtype()
+        )));
+    }
+
+    // Extract BF16 data
+    let matrix_data = matrix.to_vec_bf16();
+    let vector_data = vector.to_vec_bf16();
+
+    // Pack BF16 data (2 values per u32)
+    let matrix_packed = pack_bf16(&matrix_data);
+    let vector_packed = pack_bf16(&vector_data);
+
+    // Create GPU buffers
+    let matrix_bytes: Vec<u8> = matrix_packed
+        .iter()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let vector_bytes: Vec<u8> = vector_packed
+        .iter()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+
+    let matrix_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gemv-matrix"),
+        size: matrix_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue().write_buffer(&matrix_buf, 0, &matrix_bytes);
+
+    let vector_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gemv-vector"),
+        size: vector_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue().write_buffer(&vector_buf, 0, &vector_bytes);
+
+    // Create output buffer (unpacked: one u32 per BF16)
+    let output_size = (m * 4) as u64;
+    let output_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gemv-output"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Create pipeline and execute
+    let pipeline = GemvPipeline::new(ctx)?;
+    pipeline.execute(
+        ctx,
+        &matrix_buf,
+        &vector_buf,
+        &output_buf,
+        m as u32,
+        k as u32,
+    )?;
+
+    // Wait for GPU completion
+    let _ = ctx.device().poll(wgpu::PollType::wait_indefinitely());
+
+    // Read back results
+    let staging_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gemv-staging"),
+        size: output_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = ctx
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gemv-copy"),
+        });
+    encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+    ctx.queue().submit(Some(encoder.finish()));
+
+    // Map and read output
+    let buffer_slice = staging_buf.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    let _ = ctx.device().poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().unwrap().unwrap();
+
+    let data = buffer_slice.get_mapped_range();
+    let output_bytes: Vec<u8> = data.to_vec();
+    drop(data);
+    staging_buf.unmap();
+
+    // Unpack output (one u32 per BF16, value in low 16 bits)
+    let output_u32s: Vec<u32> = output_bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+
+    let output_bf16: Vec<BF16> = output_u32s
+        .iter()
+        .map(|u| BF16::from_bits((u & 0xFFFF) as u16))
+        .collect();
+
+    // Return as BF16 tensor with shape [M]
+    crate::tensor::Tensor::from_bf16(output_bf16, vec![m])
+}
+
+/// Helper to pack BF16 values into u32 array (2 BF16 per u32).
+fn pack_bf16(data: &[crate::bf16::BF16]) -> Vec<u32> {
+    let mut packed = Vec::with_capacity(data.len().div_ceil(2));
+    for chunk in data.chunks(2) {
+        let low = chunk[0].to_bits() as u32;
+        let high = if chunk.len() > 1 {
+            chunk[1].to_bits() as u32
+        } else {
+            0
+        };
+        packed.push(low | (high << 16));
+    }
+    packed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bf16::BF16;
     use crate::gpu;
-
-    /// Helper to pack BF16 values into u32 array (2 BF16 per u32)
-    fn pack_bf16(data: &[BF16]) -> Vec<u32> {
-        let mut packed = Vec::with_capacity((data.len() + 1) / 2);
-        for chunk in data.chunks(2) {
-            let low = chunk[0].to_bits() as u32;
-            let high = if chunk.len() > 1 {
-                chunk[1].to_bits() as u32
-            } else {
-                0
-            };
-            packed.push(low | (high << 16));
-        }
-        packed
-    }
 
     #[test]
     fn test_gemv_small() {

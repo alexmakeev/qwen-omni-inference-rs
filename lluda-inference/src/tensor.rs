@@ -320,6 +320,36 @@ impl Tensor {
         }
     }
 
+    /// Extract tensor data as BF16 vector.
+    ///
+    /// Clones BF16 data if already BF16, converts from F32 if F32.
+    ///
+    /// # Panics
+    ///
+    /// Panics if tensor data is on GPU. Use to_cpu() first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    /// use lluda_inference::bf16::BF16;
+    ///
+    /// let bf16_data = vec![BF16::from(1.0), BF16::from(2.0), BF16::from(3.0)];
+    /// let t = Tensor::from_bf16(bf16_data.clone(), vec![3]).unwrap();
+    /// let data = t.to_vec_bf16();
+    /// assert_eq!(data.len(), 3);
+    /// ```
+    pub fn to_vec_bf16(&self) -> Vec<BF16> {
+        match &self.data {
+            TensorData::BF16(v) => v.clone(),
+            TensorData::F32(v) => v.iter().map(|&f| BF16::from(f)).collect(),
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                panic!("Cannot extract BF16 data from GPU buffer. Use to_cpu() first.")
+            }
+        }
+    }
+
     /// Reshape tensor to a new shape without copying data (Phase 0: copies data).
     ///
     /// The total number of elements must remain the same.
@@ -368,7 +398,7 @@ impl Tensor {
             TensorData::BF16(data) => Tensor::from_bf16(data.clone(), new_shape.to_vec()),
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
-                return Err(LludaError::Msg(
+                Err(LludaError::Msg(
                     "Cannot reshape GPU buffer. Use to_cpu() first.".to_string(),
                 ))
             }
@@ -749,13 +779,65 @@ impl Tensor {
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
 
-        // Both tensors must be at least 2D
+        // GPU GEMV dispatch: Detect 2D × 1D (matrix × vector) case
+        #[cfg(feature = "gpu")]
+        {
+            if self.is_gemv_candidate(rhs) {
+                // Try GPU acceleration if both tensors are BF16 and size is large enough
+                if let Ok(result) = self.try_gemv_gpu(rhs) {
+                    return Ok(result);
+                }
+                // If GPU fails, fall through to CPU implementation
+            }
+        }
+
+        // LHS must be at least 2D
         if lhs_shape.len() < 2 {
             return Err(LludaError::ShapeMismatch {
                 expected: vec![0, 0], // at least 2D
                 got: lhs_shape.to_vec(),
             });
         }
+
+        // RHS can be 1D (vector) or 2D+ (matrix)
+        // If RHS is 1D, convert to matmul_2d with rhs reshaped as (N, 1)
+        if rhs_shape.len() == 1 {
+            // GEMV case: [M, K] @ [K] -> [M]
+            if lhs_shape.len() != 2 {
+                return Err(LludaError::Msg(format!(
+                    "matmul: for vector RHS, LHS must be 2D, got {}D",
+                    lhs_shape.len()
+                )));
+            }
+
+            let m = lhs_shape[0];
+            let k = lhs_shape[1];
+            let n_rhs = rhs_shape[0];
+
+            if k != n_rhs {
+                return Err(LludaError::ShapeMismatch {
+                    expected: vec![m, k],
+                    got: vec![n_rhs],
+                });
+            }
+
+            // CPU fallback: treat as [M, K] @ [K, 1] -> [M, 1], then squeeze to [M]
+            let lhs_data = self.to_vec_f32();
+            let rhs_data = rhs.to_vec_f32();
+
+            let mut result = vec![0.0f32; m];
+            for i in 0..m {
+                let mut sum = 0.0f32;
+                for k_idx in 0..k {
+                    sum += lhs_data[i * k + k_idx] * rhs_data[k_idx];
+                }
+                result[i] = sum;
+            }
+
+            return Tensor::new(result, vec![m]);
+        }
+
+        // RHS must be at least 2D for remaining cases
         if rhs_shape.len() < 2 {
             return Err(LludaError::ShapeMismatch {
                 expected: vec![0, 0], // at least 2D
@@ -788,6 +870,63 @@ impl Tensor {
                 rhs_shape.len()
             ))),
         }
+    }
+
+    /// Check if this matmul can be accelerated by GEMV (matrix × vector).
+    ///
+    /// Returns true if:
+    /// - LHS is 2D (matrix)
+    /// - RHS is 1D (vector)
+    /// - Inner dimensions match
+    #[cfg(feature = "gpu")]
+    fn is_gemv_candidate(&self, rhs: &Tensor) -> bool {
+        let lhs_shape = self.shape();
+        let rhs_shape = rhs.shape();
+
+        // LHS must be 2D, RHS must be 1D
+        if lhs_shape.len() != 2 || rhs_shape.len() != 1 {
+            return false;
+        }
+
+        // Inner dimensions must match
+        let k = lhs_shape[1];
+        let n = rhs_shape[0];
+
+        k == n
+    }
+
+    /// Try to execute GEMV on GPU.
+    ///
+    /// Returns Ok(result) if GPU execution succeeds, Err otherwise.
+    /// Caller should fall back to CPU on error.
+    #[cfg(feature = "gpu")]
+    fn try_gemv_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
+        use crate::gpu;
+
+        // Both tensors must be BF16
+        if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
+            return Err(LludaError::Msg("GPU GEMV requires BF16 tensors".into()));
+        }
+
+        // Size threshold: Use GPU only if M*N > 1024 to avoid dispatch overhead
+        let m = self.shape()[0];
+        let n = self.shape()[1];
+        if m * n <= 1024 {
+            return Err(LludaError::Msg("Matrix too small for GPU acceleration".into()));
+        }
+
+        // Get GPU context (initialized on first use)
+        let ctx = gpu::get_context()?;
+
+        // Execute GEMV on GPU
+        let result = gpu::gemv::gemv_forward(ctx, self, rhs)?;
+
+        // Convert result to F32 for consistency with CPU path
+        // (All compute operations return F32 in Phase 0)
+        let result_bf16 = result.to_vec_bf16();
+        let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
+
+        Tensor::new(result_f32, vec![m])
     }
 
     /// Element-wise addition: self + rhs
@@ -4838,5 +4977,89 @@ mod tests {
         let result = t.to_cpu(&ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not on GPU"));
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn test_matmul_gemv_gpu_integration() {
+        use crate::bf16::BF16;
+        use crate::gpu;
+
+        // Skip if GPU not available
+        if gpu::get_context().is_err() {
+            println!("Skipping GPU GEMV test: No GPU available");
+            return;
+        }
+
+        // Create large enough matrix to trigger GPU dispatch (M*N > 1024)
+        // Matrix: 64×32 (2048 elements > 1024 threshold)
+        let m = 64;
+        let n = 32;
+
+        // Create test data: matrix with sequential values, vector with 1.0
+        let matrix_data: Vec<BF16> = (0..m)
+            .flat_map(|i| (0..n).map(move |j| BF16::from((i * n + j) as f32)))
+            .collect();
+        let vector_data: Vec<BF16> = (0..n).map(|_| BF16::from(1.0f32)).collect();
+
+        let matrix = Tensor::from_bf16(matrix_data, vec![m, n]).unwrap();
+        let vector = Tensor::from_bf16(vector_data, vec![n]).unwrap();
+
+        // Execute matmul (should dispatch to GPU)
+        let result_gpu = matrix.matmul(&vector).unwrap();
+
+        // Validate shape
+        assert_eq!(result_gpu.shape(), &[m]);
+
+        // Validate values: each row i should sum to: sum(i*32 + 0..31) = i*32*32 + sum(0..31)
+        // sum(0..31) = 31*32/2 = 496
+        let result_data = result_gpu.to_vec_f32();
+        for i in 0..m {
+            let expected = (i * n * n + (n - 1) * n / 2) as f32;
+            let got = result_data[i];
+            let diff = (got - expected).abs();
+            // Allow tolerance for BF16 accumulation errors
+            assert!(
+                diff < expected * 0.01, // 1% tolerance
+                "Row {} mismatch: got {}, expected {} (diff {})",
+                i,
+                got,
+                expected,
+                diff
+            );
+        }
+
+        println!("GPU GEMV integration test passed! Validated {}×{} GEMV", m, n);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn test_matmul_gemv_cpu_fallback() {
+        use crate::bf16::BF16;
+
+        // Small matrix (M*N = 8*4 = 32 < 1024 threshold)
+        // Should fall back to CPU even with BF16 tensors
+        let m = 8;
+        let n = 4;
+
+        let matrix_data: Vec<BF16> = (0..m)
+            .flat_map(|i| (0..n).map(move |j| BF16::from((i + j) as f32)))
+            .collect();
+        let vector_data: Vec<BF16> = (0..n).map(|i| BF16::from(i as f32)).collect();
+
+        let matrix = Tensor::from_bf16(matrix_data, vec![m, n]).unwrap();
+        let vector = Tensor::from_bf16(vector_data, vec![n]).unwrap();
+
+        let result = matrix.matmul(&vector).unwrap();
+
+        // Validate shape
+        assert_eq!(result.shape(), &[m]);
+
+        // Manually compute expected for row 0: [0,1,2,3] · [0,1,2,3] = 0+1+4+9 = 14
+        let result_data = result.to_vec_f32();
+        let expected_0 = 0.0 * 0.0 + 1.0 * 1.0 + 2.0 * 2.0 + 3.0 * 3.0;
+        assert!((result_data[0] - expected_0).abs() < 0.1);
+
+        println!("CPU fallback test passed! Small matrix used CPU path");
     }
 }

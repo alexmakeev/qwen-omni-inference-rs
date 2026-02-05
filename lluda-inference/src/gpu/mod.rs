@@ -20,6 +20,7 @@ pub mod buffer;
 pub mod gemv;
 
 use crate::error::{LludaError, Result};
+use std::sync::OnceLock;
 use wgpu;
 
 /// GPU context holding device, queue, and adapter.
@@ -118,6 +119,49 @@ pub fn init() -> Result<GpuContext> {
         device,
         queue,
     })
+}
+
+/// Global GPU context singleton.
+///
+/// Lazily initialized on first access. If GPU initialization fails,
+/// the singleton stores None and all subsequent calls will fail.
+static GPU_CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
+
+/// Get reference to the global GPU context singleton.
+///
+/// On first call, attempts to initialize GPU. If initialization fails,
+/// stores None and all subsequent calls will return an error.
+///
+/// # Errors
+///
+/// Returns error if:
+/// - GPU initialization failed (no suitable GPU, driver issues)
+/// - GPU was previously initialized but failed
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use lluda_inference::gpu::get_context;
+///
+/// match get_context() {
+///     Ok(ctx) => println!("GPU available: {}", ctx.adapter_info().name),
+///     Err(e) => eprintln!("GPU not available: {}", e),
+/// }
+/// ```
+pub fn get_context() -> Result<&'static GpuContext> {
+    GPU_CONTEXT
+        .get_or_init(|| match init() {
+            Ok(ctx) => {
+                eprintln!("GPU initialized: {:?}", ctx.adapter_info().name);
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("GPU init failed: {}, falling back to CPU", e);
+                None
+            }
+        })
+        .as_ref()
+        .ok_or_else(|| LludaError::Msg("GPU not available".into()))
 }
 
 #[cfg(test)]
