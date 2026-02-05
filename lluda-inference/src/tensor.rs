@@ -776,80 +776,82 @@ impl Tensor {
     /// assert_eq!(c.shape(), &[2, 2]);
     /// ```
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
+        // GPU MODE: Strict GPU-or-fail policy (see GPU_DESIGN_PRINCIPLES.md)
+        // No fallbacks - operations must use GPU or return error
+        #[cfg(feature = "gpu")]
+        {
+            return self.matmul_gpu(rhs);
+        }
+
+        // CPU MODE: Standard CPU implementation
+        #[cfg(not(feature = "gpu"))]
+        {
+            return self.matmul_cpu(rhs);
+        }
+    }
+
+    /// GPU implementation of matmul - strict GPU-or-fail (no CPU fallback).
+    #[cfg(feature = "gpu")]
+    fn matmul_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
+        let profiling = std::env::var("PROFILE").is_ok();
 
-        // GPU GEMM dispatch: Detect 2D × 2D (matrix × matrix) case
-        #[cfg(feature = "gpu")]
-        {
-            if self.is_gemm_candidate(rhs) {
-                let profiling_enabled = std::env::var("PROFILE").is_ok();
-                if profiling_enabled {
-                    eprintln!(
-                        "[GPU] GEMM candidate detected: {}x{} @ {}x{}",
-                        lhs_shape[0], lhs_shape[1], rhs_shape[0], rhs_shape[1]
-                    );
-                    eprintln!("[GPU]   LHS dtype: {:?}, RHS dtype: {:?}", self.dtype(), rhs.dtype());
-                }
-
-                // Try GPU acceleration if both tensors are BF16 and size is large enough
-                let gpu_start = std::time::Instant::now();
-                match self.try_gemm_gpu(rhs) {
-                    Ok(result) => {
-                        if profiling_enabled {
-                            eprintln!(
-                                "[GPU]   GPU GEMM path SUCCESS: {:.2}ms",
-                                gpu_start.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        if profiling_enabled {
-                            eprintln!("[GPU]   GPU GEMM path FAILED: {}", e);
-                            eprintln!("[GPU]   Falling back to CPU");
-                        }
-                    }
-                }
-                // If GPU fails, fall through to CPU implementation
+        // Check 2D × 2D GEMM
+        if lhs_shape.len() == 2 && rhs_shape.len() == 2 {
+            if profiling {
+                eprintln!(
+                    "[GPU] matmul dispatch: {}×{} @ {}×{} (2D×2D GEMM)",
+                    lhs_shape[0], lhs_shape[1], rhs_shape[0], rhs_shape[1]
+                );
+                eprintln!("[GPU]   dtype: {:?}×{:?}", self.dtype(), rhs.dtype());
             }
+            let start = std::time::Instant::now();
+            let result = self.matmul_gemm_gpu(rhs)?;
+            if profiling {
+                eprintln!(
+                    "[GPU]   GEMM execution: {:.2}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(result);
         }
 
-        // GPU GEMV dispatch: Detect 2D × 1D (matrix × vector) case
-        #[cfg(feature = "gpu")]
-        {
-            if self.is_gemv_candidate(rhs) {
-                let profiling_enabled = std::env::var("PROFILE").is_ok();
-                if profiling_enabled {
-                    eprintln!(
-                        "[GPU] GEMV candidate detected: {}x{} @ {}x{}",
-                        lhs_shape[0], lhs_shape[1], rhs_shape[0], 1
-                    );
-                    eprintln!("[GPU]   LHS dtype: {:?}, RHS dtype: {:?}", self.dtype(), rhs.dtype());
-                }
-
-                // Try GPU acceleration if both tensors are BF16 and size is large enough
-                let gpu_start = std::time::Instant::now();
-                match self.try_gemv_gpu(rhs) {
-                    Ok(result) => {
-                        if profiling_enabled {
-                            eprintln!(
-                                "[GPU]   GPU path SUCCESS: {:.2}ms",
-                                gpu_start.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        if profiling_enabled {
-                            eprintln!("[GPU]   GPU path FAILED: {}", e);
-                            eprintln!("[GPU]   Falling back to CPU");
-                        }
-                    }
-                }
-                // If GPU fails, fall through to CPU implementation
+        // Check 2D × 1D GEMV
+        if lhs_shape.len() == 2 && rhs_shape.len() == 1 {
+            if profiling {
+                eprintln!(
+                    "[GPU] matmul dispatch: {}×{} @ {} (2D×1D GEMV)",
+                    lhs_shape[0], lhs_shape[1], rhs_shape[0]
+                );
+                eprintln!("[GPU]   dtype: {:?}×{:?}", self.dtype(), rhs.dtype());
             }
+            let start = std::time::Instant::now();
+            let result = self.matmul_gemv_gpu(rhs)?;
+            if profiling {
+                eprintln!(
+                    "[GPU]   GEMV execution: {:.2}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(result);
         }
+
+        // Unsupported shape in GPU mode
+        Err(LludaError::Msg(format!(
+            "GPU mode: unsupported matmul shapes {}D×{}D. \
+             Only 2D×2D (GEMM) and 2D×1D (GEMV) are supported on GPU. \
+             Use CPU mode (remove --features gpu) for batched operations (3D, 4D).",
+            lhs_shape.len(),
+            rhs_shape.len()
+        )))
+    }
+
+    /// CPU implementation of matmul - supports all shapes.
+    #[cfg(not(feature = "gpu"))]
+    fn matmul_cpu(&self, rhs: &Tensor) -> Result<Tensor> {
+        let lhs_shape = self.shape();
+        let rhs_shape = rhs.shape();
 
         // LHS must be at least 2D
         if lhs_shape.len() < 2 {
@@ -881,7 +883,7 @@ impl Tensor {
                 });
             }
 
-            // CPU fallback: treat as [M, K] @ [K, 1] -> [M, 1], then squeeze to [M]
+            // CPU implementation: treat as [M, K] @ [K, 1] -> [M, 1], then squeeze to [M]
             let lhs_data = self.to_vec_f32();
             let rhs_data = rhs.to_vec_f32();
 
@@ -939,243 +941,127 @@ impl Tensor {
     /// - RHS is 1D (vector)
     /// - Inner dimensions match
     #[cfg(feature = "gpu")]
-    fn is_gemv_candidate(&self, rhs: &Tensor) -> bool {
-        let profiling_enabled = std::env::var("PROFILE").is_ok();
+    /// Execute GEMV (matrix × vector) on GPU - strict mode (no fallback).
+    ///
+    /// Requirements:
+    /// - LHS must be 2D, RHS must be 1D
+    /// - Both tensors must be BF16
+    /// - Inner dimensions must match
+    ///
+    /// Returns error if requirements not met (no CPU fallback).
+    #[cfg(feature = "gpu")]
+    fn matmul_gemv_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
+        use crate::gpu;
+
+        let profiling = std::env::var("PROFILE").is_ok();
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
 
-        // LHS must be 2D, RHS must be 1D
+        // Validate shapes
         if lhs_shape.len() != 2 || rhs_shape.len() != 1 {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMV rejected: shape mismatch (need 2D×1D, got {}D×{}D): {:?} × {:?}",
-                    lhs_shape.len(),
-                    rhs_shape.len(),
-                    lhs_shape,
-                    rhs_shape
-                );
-            }
-            return false;
+            return Err(LludaError::Msg(format!(
+                "GPU GEMV requires 2D×1D shapes, got {}D×{}D",
+                lhs_shape.len(), rhs_shape.len()
+            )));
         }
 
-        // Inner dimensions must match
+        let m = lhs_shape[0];
         let k = lhs_shape[1];
         let n = rhs_shape[0];
 
         if k != n {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMV rejected: inner dimension mismatch ({}×{} @ {})",
-                    lhs_shape[0], k, n
-                );
-            }
-            return false;
+            return Err(LludaError::Msg(format!(
+                "GPU GEMV shape mismatch: {}×{} @ {} (K dimension must match)",
+                m, k, n
+            )));
         }
 
-        if profiling_enabled {
-            eprintln!(
-                "[GPU] GEMV candidate ACCEPTED: {}×{} @ {}",
-                lhs_shape[0], k, n
-            );
-        }
-
-        true
-    }
-
-    /// Try to execute GEMV on GPU.
-    ///
-    /// Returns Ok(result) if GPU execution succeeds, Err otherwise.
-    /// Caller should fall back to CPU on error.
-    #[cfg(feature = "gpu")]
-    fn try_gemv_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
-        use crate::gpu;
-
-        let profiling_enabled = std::env::var("PROFILE").is_ok();
-
-        // Both tensors must be BF16
+        // Strict dtype requirement
         if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
-            return Err(LludaError::Msg("GPU GEMV requires BF16 tensors".into()));
+            return Err(LludaError::Msg(format!(
+                "GPU GEMV requires BF16 tensors, got {:?}×{:?}. \
+                 Convert tensors to BF16 before GPU operations.",
+                self.dtype(), rhs.dtype()
+            )));
         }
 
-        // Size threshold: Use GPU only if M*N > 1024 to avoid dispatch overhead
-        let m = self.shape()[0];
-        let n = self.shape()[1];
-        if m * n <= 1024 {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU]   Matrix too small for GPU: {}x{} ({})",
-                    m, n, m * n
-                );
-            }
-            return Err(LludaError::Msg("Matrix too small for GPU acceleration".into()));
-        }
-
-        // Get GPU context (initialized on first use)
-        let ctx_start = std::time::Instant::now();
+        // Get GPU context
         let ctx = gpu::get_context()?;
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   Get context: {:.2}ms",
-                ctx_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
 
         // Execute GEMV on GPU
-        let gemv_start = std::time::Instant::now();
-        let result = gpu::gemv::gemv_forward(ctx, self, rhs)?;
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   GEMV forward (upload+compute+download): {:.2}ms",
-                gemv_start.elapsed().as_secs_f64() * 1000.0
-            );
+        if profiling {
+            eprintln!("[GPU]   Executing GEMV: {}×{} @ {}", m, k, n);
         }
+        let result = gpu::gemv::gemv_forward(ctx, self, rhs)?;
 
-        // Convert result to F32 for consistency with CPU path
-        // (All compute operations return F32 in Phase 0)
-        let convert_start = std::time::Instant::now();
+        // Convert result to F32 for consistency
         let result_bf16 = result.to_vec_bf16();
         let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   BF16 -> F32 conversion: {:.2}ms",
-                convert_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
 
         Tensor::new(result_f32, vec![m])
     }
 
-    /// Check if this matmul is a candidate for GPU GEMM acceleration.
+    /// Execute GEMM (matrix × matrix) on GPU - strict mode (no fallback).
     ///
     /// Requirements:
-    /// - LHS must be 2D
-    /// - RHS must be 2D
-    /// - Inner dimensions must match
-    /// - Both must be BF16
-    /// - Size threshold: M*K*N > 8192 (avoid overhead for small matrices)
+    /// - Both LHS and RHS must be 2D
+    /// - Both tensors must be BF16
+    /// - Inner dimensions must match (K)
+    ///
+    /// Returns error if requirements not met (no CPU fallback).
     #[cfg(feature = "gpu")]
-    fn is_gemm_candidate(&self, rhs: &Tensor) -> bool {
-        let profiling_enabled = std::env::var("PROFILE").is_ok();
+    fn matmul_gemm_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
+        use crate::gpu;
+
+        let profiling = std::env::var("PROFILE").is_ok();
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
 
-        // Both must be 2D
+        // Validate shapes
         if lhs_shape.len() != 2 || rhs_shape.len() != 2 {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMM rejected: shape mismatch (need 2D×2D, got {}D×{}D): {:?} × {:?}",
-                    lhs_shape.len(),
-                    rhs_shape.len(),
-                    lhs_shape,
-                    rhs_shape
-                );
-            }
-            return false;
+            return Err(LludaError::Msg(format!(
+                "GPU GEMM requires 2D×2D shapes, got {}D×{}D",
+                lhs_shape.len(), rhs_shape.len()
+            )));
         }
 
-        // Inner dimensions must match
-        let k_lhs = lhs_shape[1];
-        let k_rhs = rhs_shape[0];
-
-        if k_lhs != k_rhs {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMM rejected: inner dimension mismatch ({}×{} @ {}×{})",
-                    lhs_shape[0], k_lhs, k_rhs, rhs_shape[1]
-                );
-            }
-            return false;
-        }
-
-        // Both must be BF16
-        if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMM rejected: dtype mismatch (need BF16×BF16, got {:?}×{:?})",
-                    self.dtype(),
-                    rhs.dtype()
-                );
-            }
-            return false;
-        }
-
-        // Size threshold: M*K*N > 8192
         let m = lhs_shape[0];
-        let k = k_lhs;
+        let k1 = lhs_shape[1];
+        let k2 = rhs_shape[0];
         let n = rhs_shape[1];
-        let work_size = m * k * n;
 
-        if work_size <= 8192 {
-            if profiling_enabled {
-                eprintln!(
-                    "[GPU] GEMM rejected: matrix too small ({}×{}×{} = {} <= 8192)",
-                    m, k, n, work_size
-                );
-            }
-            return false;
+        if k1 != k2 {
+            return Err(LludaError::Msg(format!(
+                "GPU GEMM shape mismatch: {}×{} @ {}×{} (K dimensions must match)",
+                m, k1, k2, n
+            )));
         }
 
-        if profiling_enabled {
-            eprintln!(
-                "[GPU] GEMM candidate ACCEPTED: {}×{} @ {}×{} (work size: {})",
-                m, k, k, n, work_size
-            );
-        }
-
-        true
-    }
-
-    /// Try to execute GEMM on GPU.
-    ///
-    /// Returns Ok(result) if GPU execution succeeds, Err otherwise.
-    /// Caller should fall back to CPU on error.
-    #[cfg(feature = "gpu")]
-    fn try_gemm_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
-        use crate::gpu;
-
-        let profiling_enabled = std::env::var("PROFILE").is_ok();
-
-        // Both tensors must be BF16 (already checked in is_gemm_candidate)
+        // Strict dtype requirement
         if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
-            return Err(LludaError::Msg("GPU GEMM requires BF16 tensors".into()));
+            return Err(LludaError::Msg(format!(
+                "GPU GEMM requires BF16 tensors, got {:?}×{:?}. \
+                 Convert tensors to BF16 before GPU operations.",
+                self.dtype(), rhs.dtype()
+            )));
         }
 
-        // Get GPU context (initialized on first use)
-        let ctx_start = std::time::Instant::now();
+        // Get GPU context
         let ctx = gpu::get_context()?;
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   Get context: {:.2}ms",
-                ctx_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
 
         // Execute GEMM on GPU
-        let gemm_start = std::time::Instant::now();
-        let result = gpu::gemm::gemm_forward(ctx, self, rhs)?;
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   GEMM forward (upload+compute+download): {:.2}ms",
-                gemm_start.elapsed().as_secs_f64() * 1000.0
-            );
+        if profiling {
+            eprintln!("[GPU]   Executing GEMM: {}×{} @ {}×{}", m, k1, k2, n);
         }
+        let result = gpu::gemm::gemm_forward(ctx, self, rhs)?;
 
-        // Convert result to F32 for consistency with CPU path
-        // (All compute operations return F32 in Phase 0)
-        let convert_start = std::time::Instant::now();
+        // Convert result to F32 for consistency
         let result_bf16 = result.to_vec_bf16();
         let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
-        if profiling_enabled {
-            eprintln!(
-                "[GPU]   BF16 -> F32 conversion: {:.2}ms",
-                convert_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
 
-        let m = self.shape()[0];
-        let n = rhs.shape()[1];
         Tensor::new(result_f32, vec![m, n])
     }
+
 
     /// Element-wise addition: self + rhs
     ///
@@ -5315,7 +5201,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     fn test_tensor_matmul_gemm_integration() {
         // Test that matmul dispatches to GPU GEMM for 2D×2D BF16 matrices
-        // This tests the full integration: Tensor::matmul() -> is_gemm_candidate -> try_gemm_gpu -> gemm_forward
+        // This tests the full integration: Tensor::matmul() -> matmul_gpu() -> matmul_gemm_gpu() -> gemm_forward
 
         // Create BF16 matrices similar to real workload
         // A: 5×1024, B: 1024×128
@@ -5334,7 +5220,7 @@ mod tests {
         let a = Tensor::from_bf16(a_data.clone(), vec![m, k]).unwrap();
         let b = Tensor::from_bf16(b_data.clone(), vec![k, n]).unwrap();
 
-        // Execute matmul (should use GPU GEMM based on is_gemm_candidate)
+        // Execute matmul (strict GPU mode - uses GEMM or fails)
         let c = a.matmul(&b).unwrap();
 
         // Verify shape

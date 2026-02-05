@@ -165,8 +165,12 @@ pub fn get_context() -> Result<&'static GpuContext> {
                 Some(ctx)
             }
             Err(e) => {
-                eprintln!("[GPU] GPU init failed: {}, falling back to CPU", e);
-                None
+                // STRICT MODE: No CPU fallback when GPU feature enabled
+                panic!(
+                    "GPU initialization failed: {}.\n\
+                     Cannot run in GPU mode. Remove --features gpu to use CPU.",
+                    e
+                );
             }
         })
         .as_ref()
