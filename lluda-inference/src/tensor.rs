@@ -437,6 +437,8 @@ impl Tensor {
     /// assert_eq!(data, vec![1.0, 3.0, 2.0, 4.0]);
     /// ```
     pub fn transpose(&self) -> Result<Tensor> {
+        use crate::bf16::BF16;
+
         if self.ndim() != 2 {
             return Err(LludaError::DimOutOfRange {
                 dim: 2,
@@ -446,18 +448,42 @@ impl Tensor {
 
         let m = self.shape[0];
         let n = self.shape[1];
-        let data = self.to_vec_f32();
-        let mut result = vec![0.0; m * n];
 
-        // Transpose: output[j, i] = input[i, j]
-        // Row-major indexing: input[i * n + j] -> output[j * m + i]
-        for i in 0..m {
-            for j in 0..n {
-                result[j * m + i] = data[i * n + j];
+        // Preserve dtype: BF16 stays BF16, F32 stays F32
+        match &self.data {
+            TensorData::BF16(data) => {
+                let mut result = vec![BF16::from(0.0f32); m * n];
+
+                // Transpose: output[j, i] = input[i, j]
+                // Row-major indexing: input[i * n + j] -> output[j * m + i]
+                for i in 0..m {
+                    for j in 0..n {
+                        result[j * m + i] = data[i * n + j];
+                    }
+                }
+
+                Tensor::from_bf16(result, vec![n, m])
+            }
+            TensorData::F32(data) => {
+                let mut result = vec![0.0; m * n];
+
+                // Transpose: output[j, i] = input[i, j]
+                // Row-major indexing: input[i * n + j] -> output[j * m + i]
+                for i in 0..m {
+                    for j in 0..n {
+                        result[j * m + i] = data[i * n + j];
+                    }
+                }
+
+                Tensor::new(result, vec![n, m])
+            }
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                Err(LludaError::Msg(
+                    "Cannot transpose GPU buffer. Use to_cpu() first.".to_string(),
+                ))
             }
         }
-
-        Tensor::new(result, vec![n, m])
     }
 
     /// Transpose two dimensions of a tensor.
@@ -994,11 +1020,8 @@ impl Tensor {
         }
         let result = gpu::gemv::gemv_forward(ctx, self, rhs)?;
 
-        // Convert result to F32 for consistency
-        let result_bf16 = result.to_vec_bf16();
-        let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
-
-        Tensor::new(result_f32, vec![m])
+        // Keep result in BF16 - no conversion!
+        Ok(result)
     }
 
     /// Execute GEMM (matrix × matrix) on GPU - strict mode (no fallback).
@@ -1055,11 +1078,8 @@ impl Tensor {
         }
         let result = gpu::gemm::gemm_forward(ctx, self, rhs)?;
 
-        // Convert result to F32 for consistency
-        let result_bf16 = result.to_vec_bf16();
-        let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
-
-        Tensor::new(result_f32, vec![m, n])
+        // Keep result in BF16 - no conversion!
+        Ok(result)
     }
 
 
@@ -1100,24 +1120,54 @@ impl Tensor {
     /// assert_eq!(c.to_vec_f32(), vec![5.0, 7.0, 9.0]);
     /// ```
     pub fn add(&self, rhs: &Tensor) -> Result<Tensor> {
-        // Convert both to F32 for computation
-        let lhs_data = self.to_vec_f32();
-        let rhs_data = rhs.to_vec_f32();
+        use crate::bf16::BF16;
 
-        // Fast path: same shape (no broadcast needed)
-        if self.shape() == rhs.shape() {
-            let result: Vec<f32> = lhs_data
-                .iter()
-                .zip(rhs_data.iter())
-                .map(|(a, b)| a + b)
-                .collect();
-            return Tensor::new(result, self.shape().to_vec());
+        // Preserve BF16 if both are BF16, otherwise use F32
+        match (&self.data, &rhs.data) {
+            (TensorData::BF16(lhs_data), TensorData::BF16(rhs_data)) => {
+                // Fast path: same shape (no broadcast needed)
+                if self.shape() == rhs.shape() {
+                    let result: Vec<BF16> = lhs_data
+                        .iter()
+                        .zip(rhs_data.iter())
+                        .map(|(&a, &b)| {
+                            // Add in F32 for precision, convert back to BF16
+                            let a_f32: f32 = a.into();
+                            let b_f32: f32 = b.into();
+                            BF16::from(a_f32 + b_f32)
+                        })
+                        .collect();
+                    return Tensor::from_bf16(result, self.shape().to_vec());
+                }
+
+                // BF16 broadcasting - convert to F32, broadcast, convert back
+                let lhs_f32: Vec<f32> = lhs_data.iter().map(|&x| x.into()).collect();
+                let rhs_f32: Vec<f32> = rhs_data.iter().map(|&x| x.into()).collect();
+                let result_f32 = broadcast_binary_op(&lhs_f32, self.shape(), &rhs_f32, rhs.shape(), |a, b| a + b)?;
+                let result_bf16: Vec<BF16> = result_f32.to_vec_f32().iter().map(|&x| BF16::from(x)).collect();
+                Tensor::from_bf16(result_bf16, result_f32.shape().to_vec())
+            }
+            _ => {
+                // Mixed dtypes or F32: convert both to F32
+                let lhs_data = self.to_vec_f32();
+                let rhs_data = rhs.to_vec_f32();
+
+                // Fast path: same shape (no broadcast needed)
+                if self.shape() == rhs.shape() {
+                    let result: Vec<f32> = lhs_data
+                        .iter()
+                        .zip(rhs_data.iter())
+                        .map(|(a, b)| a + b)
+                        .collect();
+                    return Tensor::new(result, self.shape().to_vec());
+                }
+
+                // General NumPy-style broadcasting
+                broadcast_binary_op(&lhs_data, self.shape(), &rhs_data, rhs.shape(), |a, b| {
+                    a + b
+                })
+            }
         }
-
-        // General NumPy-style broadcasting
-        broadcast_binary_op(&lhs_data, self.shape(), &rhs_data, rhs.shape(), |a, b| {
-            a + b
-        })
     }
 
     /// Element-wise multiplication: self * rhs
@@ -1150,24 +1200,54 @@ impl Tensor {
     /// assert_eq!(c.to_vec_f32(), vec![4.0, 10.0, 18.0]);
     /// ```
     pub fn mul(&self, rhs: &Tensor) -> Result<Tensor> {
-        // Convert both to F32 for computation
-        let lhs_data = self.to_vec_f32();
-        let rhs_data = rhs.to_vec_f32();
+        use crate::bf16::BF16;
 
-        // Fast path: same shape (no broadcast needed)
-        if self.shape() == rhs.shape() {
-            let result: Vec<f32> = lhs_data
-                .iter()
-                .zip(rhs_data.iter())
-                .map(|(a, b)| a * b)
-                .collect();
-            return Tensor::new(result, self.shape().to_vec());
+        // Preserve BF16 if both are BF16, otherwise use F32
+        match (&self.data, &rhs.data) {
+            (TensorData::BF16(lhs_data), TensorData::BF16(rhs_data)) => {
+                // Fast path: same shape (no broadcast needed)
+                if self.shape() == rhs.shape() {
+                    let result: Vec<BF16> = lhs_data
+                        .iter()
+                        .zip(rhs_data.iter())
+                        .map(|(&a, &b)| {
+                            // Multiply in F32 for precision, convert back to BF16
+                            let a_f32: f32 = a.into();
+                            let b_f32: f32 = b.into();
+                            BF16::from(a_f32 * b_f32)
+                        })
+                        .collect();
+                    return Tensor::from_bf16(result, self.shape().to_vec());
+                }
+
+                // BF16 broadcasting - convert to F32, broadcast, convert back
+                let lhs_f32: Vec<f32> = lhs_data.iter().map(|&x| x.into()).collect();
+                let rhs_f32: Vec<f32> = rhs_data.iter().map(|&x| x.into()).collect();
+                let result_f32 = broadcast_binary_op(&lhs_f32, self.shape(), &rhs_f32, rhs.shape(), |a, b| a * b)?;
+                let result_bf16: Vec<BF16> = result_f32.to_vec_f32().iter().map(|&x| BF16::from(x)).collect();
+                Tensor::from_bf16(result_bf16, result_f32.shape().to_vec())
+            }
+            _ => {
+                // Mixed dtypes or F32: convert both to F32
+                let lhs_data = self.to_vec_f32();
+                let rhs_data = rhs.to_vec_f32();
+
+                // Fast path: same shape (no broadcast needed)
+                if self.shape() == rhs.shape() {
+                    let result: Vec<f32> = lhs_data
+                        .iter()
+                        .zip(rhs_data.iter())
+                        .map(|(a, b)| a * b)
+                        .collect();
+                    return Tensor::new(result, self.shape().to_vec());
+                }
+
+                // General NumPy-style broadcasting
+                broadcast_binary_op(&lhs_data, self.shape(), &rhs_data, rhs.shape(), |a, b| {
+                    a * b
+                })
+            }
         }
-
-        // General NumPy-style broadcasting
-        broadcast_binary_op(&lhs_data, self.shape(), &rhs_data, rhs.shape(), |a, b| {
-            a * b
-        })
     }
 
     /// Element-wise division: self / rhs
@@ -1759,15 +1839,40 @@ impl Tensor {
     /// assert!((result[2] - (-0.2689)).abs() < 1e-3); // silu(-1) ≈ -0.2689
     /// ```
     pub fn silu(&self) -> Result<Tensor> {
-        let data = self.to_vec_f32();
-        let result: Vec<f32> = data
-            .iter()
-            .map(|&x| {
-                // silu(x) = x / (1 + exp(-x))
-                x / (1.0 + (-x).exp())
-            })
-            .collect();
-        Tensor::new(result, self.shape.clone())
+        use crate::bf16::BF16;
+
+        // Keep in BF16 if input is BF16
+        match &self.data {
+            TensorData::BF16(data) => {
+                let result: Vec<BF16> = data
+                    .iter()
+                    .map(|&x| {
+                        // silu(x) = x / (1 + exp(-x))
+                        // Compute in F32 for precision, convert back to BF16
+                        let x_f32: f32 = x.into();
+                        let silu_val = x_f32 / (1.0 + (-x_f32).exp());
+                        BF16::from(silu_val)
+                    })
+                    .collect();
+                Tensor::from_bf16(result, self.shape.clone())
+            }
+            TensorData::F32(data) => {
+                let result: Vec<f32> = data
+                    .iter()
+                    .map(|&x| {
+                        // silu(x) = x / (1 + exp(-x))
+                        x / (1.0 + (-x).exp())
+                    })
+                    .collect();
+                Tensor::new(result, self.shape.clone())
+            }
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                Err(LludaError::Msg(
+                    "SiLU on GPU tensors not yet implemented. Use to_cpu() first.".into()
+                ))
+            }
+        }
     }
 
     /// Compute mean along a dimension.
@@ -3533,8 +3638,14 @@ mod tests {
         .unwrap();
         let c = a.add(&b).unwrap();
 
-        assert_eq!(c.dtype(), DType::F32);
-        assert_eq!(c.to_vec_f32(), vec![5.0, 7.0, 9.0]);
+        // BF16 + BF16 now stays in BF16!
+        assert_eq!(c.dtype(), DType::BF16);
+        let result = c.to_vec_bf16();
+        for (i, &val) in result.iter().enumerate() {
+            let val_f32: f32 = val.into();
+            let expected = [5.0, 7.0, 9.0][i];
+            assert!((val_f32 - expected).abs() < 0.01, "Element {}: {} vs {}", i, val_f32, expected);
+        }
     }
 
     // ========== Element-wise Multiplication Tests ==========
@@ -3770,8 +3881,8 @@ mod tests {
     // ========== BF16 Input Tests for Element-wise Ops ==========
 
     #[test]
-    fn test_elementwise_bf16_to_f32_conversion() {
-        // Verify that BF16 inputs are automatically converted to F32
+    fn test_elementwise_bf16_preserved() {
+        // Verify that BF16 inputs stay in BF16
         let a = Tensor::from_bf16(
             vec![BF16::from(2.0f32), BF16::from(4.0f32)],
             vec![2],
@@ -3784,8 +3895,13 @@ mod tests {
         .unwrap();
 
         let c = a.mul(&b).unwrap();
-        assert_eq!(c.dtype(), DType::F32);
-        assert_eq!(c.to_vec_f32(), vec![6.0, 20.0]);
+        assert_eq!(c.dtype(), DType::BF16);
+        let result = c.to_vec_bf16();
+        assert_eq!(result.len(), 2);
+        let val0: f32 = result[0].into();
+        let val1: f32 = result[1].into();
+        assert!((val0 - 6.0).abs() < 0.1);
+        assert!((val1 - 20.0).abs() < 0.1);
     }
 
     // ========== Reshape Tests ==========

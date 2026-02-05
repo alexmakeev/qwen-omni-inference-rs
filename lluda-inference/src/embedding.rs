@@ -77,7 +77,7 @@ impl Embedding {
     /// # Returns
     ///
     /// Tensor of shape `[batch_shape..., hidden_size]`
-    /// All computation in F32 regardless of weight dtype.
+    /// All computation in BF16 - preserves weight dtype.
     ///
     /// # Errors
     ///
@@ -134,10 +134,10 @@ impl Embedding {
             }
         }
 
-        // Convert weight to F32 for lookup
-        let weight_data = self.weight.to_vec_f32();
+        // Keep in BF16 - no conversion!
+        let weight_data = self.weight.to_vec_bf16();
 
-        // Perform embedding lookup
+        // Perform embedding lookup in BF16
         let mut result = Vec::with_capacity(indices.len() * hidden_size);
         for &idx in indices {
             let row_start = idx as usize * hidden_size;
@@ -149,7 +149,7 @@ impl Embedding {
         let mut output_shape = batch_shape.to_vec();
         output_shape.push(hidden_size);
 
-        Tensor::new(result, output_shape)
+        Tensor::from_bf16(result, output_shape)
     }
 
     /// Get reference to embedding weight.
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_embedding_bf16_weight() {
-        // BF16 weight should be converted to F32 automatically
+        // BF16 weight should stay in BF16
         let bf16_data: Vec<BF16> = (0..12).map(|x| BF16::from(x as f32)).collect();
         let weight = Tensor::from_bf16(bf16_data, vec![3, 4]).unwrap();
         let emb = Embedding::new(weight).unwrap();
@@ -256,12 +256,13 @@ mod tests {
         let result = emb.forward(&[1], &[1]).unwrap();
 
         assert_eq!(result.shape(), &[1, 4]);
-        assert_eq!(result.dtype(), DType::F32);
-        let data = result.to_vec_f32();
-        // Row 1: [4, 5, 6, 7] (with BF16 precision loss)
-        for (i, &val) in data.iter().enumerate() {
+        assert_eq!(result.dtype(), DType::BF16);
+        let data = result.to_vec_bf16();
+        // Row 1: [4, 5, 6, 7] (with BF16 precision)
+        for (i, val) in data.iter().enumerate() {
+            let val_f32: f32 = (*val).into();
             let expected = (4 + i) as f32;
-            assert!((val - expected).abs() < 0.01, "Expected {}, got {}", expected, val);
+            assert!((val_f32 - expected).abs() < 0.01, "Expected {}, got {}", expected, val_f32);
         }
     }
 

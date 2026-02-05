@@ -31,6 +31,7 @@
 //! Zhang & Sennrich (2019): "Root Mean Square Layer Normalization"
 //! https://arxiv.org/abs/1910.07467
 
+use crate::bf16::BF16;
 use crate::error::{LludaError, Result};
 use crate::tensor::Tensor;
 
@@ -139,15 +140,15 @@ impl RmsNorm {
             });
         }
 
-        // Get input data as F32 for compute
-        let data = x.to_vec_f32();
-        let weight_data = self.weight.to_vec_f32();
+        // Keep in BF16 - no conversion!
+        let data = x.to_vec_bf16();
+        let weight_data = self.weight.to_vec_bf16();
 
         // Compute total number of elements and number of vectors to normalize
         let numel = data.len();
         let num_vectors = numel / last_dim;
 
-        let mut result = vec![0.0f32; numel];
+        let mut result_bf16 = Vec::with_capacity(numel);
 
         // Process each vector independently
         for vec_idx in 0..num_vectors {
@@ -155,18 +156,24 @@ impl RmsNorm {
             let end = start + last_dim;
             let vec_data = &data[start..end];
 
-            // Compute inverse RMS: 1.0 / sqrt(mean(x^2) + eps)
-            let sum_sq: f32 = vec_data.iter().map(|&x| x * x).sum();
+            // Compute inverse RMS in F32 for numerical stability
+            let sum_sq: f32 = vec_data.iter().map(|&x| {
+                let val: f32 = x.into();
+                val * val
+            }).sum();
             let mean_sq = sum_sq / last_dim as f32;
             let inv_rms = 1.0 / (mean_sq + self.eps as f32).sqrt();
 
-            // Normalize and scale: x * inv_rms * weight
+            // Normalize and scale, then convert back to BF16
             for i in 0..last_dim {
-                result[start + i] = vec_data[i] * inv_rms * weight_data[i];
+                let val: f32 = vec_data[i].into();
+                let w: f32 = weight_data[i].into();
+                let normalized = val * inv_rms * w;
+                result_bf16.push(BF16::from(normalized));
             }
         }
 
-        Tensor::new(result, input_shape.to_vec())
+        Tensor::from_bf16(result_bf16, input_shape.to_vec())
     }
 }
 
@@ -185,6 +192,9 @@ mod tests {
         );
     }
 
+    // BF16 precision tolerance - roughly 1/256 precision
+    const BF16_TOL: f32 = 2e-2;
+
     #[test]
     fn test_rms_norm_uniform_input() {
         // Input: [1, 1, 1], weight: [1, 1, 1], eps: 1e-6
@@ -201,9 +211,9 @@ mod tests {
         // RMS of [1, 1, 1] is 1.0
         // Normalized: [1/1, 1/1, 1/1] = [1, 1, 1]
         // Scaled by weight [1, 1, 1]: [1, 1, 1]
-        assert_close(data[0], 1.0, 1e-5, "element 0");
-        assert_close(data[1], 1.0, 1e-5, "element 1");
-        assert_close(data[2], 1.0, 1e-5, "element 2");
+        assert_close(data[0], 1.0, BF16_TOL, "element 0");
+        assert_close(data[1], 1.0, BF16_TOL, "element 1");
+        assert_close(data[2], 1.0, BF16_TOL, "element 2");
     }
 
     #[test]
@@ -221,9 +231,9 @@ mod tests {
         // RMS = sqrt((4 + 0 + 0) / 3) = sqrt(4/3) ≈ 1.1547
         // Normalized: [2/1.1547, 0, 0] ≈ [1.732, 0, 0]
         let rms = (4.0f32 / 3.0).sqrt();
-        assert_close(data[0], 2.0 / rms, 1e-5, "element 0");
-        assert_close(data[1], 0.0, 1e-5, "element 1");
-        assert_close(data[2], 0.0, 1e-5, "element 2");
+        assert_close(data[0], 2.0 / rms, BF16_TOL, "element 0");
+        assert_close(data[1], 0.0, BF16_TOL, "element 1");
+        assert_close(data[2], 0.0, BF16_TOL, "element 2");
     }
 
     #[test]
@@ -241,9 +251,9 @@ mod tests {
         // RMS of [1, 1, 1] is 1.0
         // Normalized: [1, 1, 1]
         // Scaled by weight: [1*2, 1*3, 1*4] = [2, 3, 4]
-        assert_close(data[0], 2.0, 1e-5, "element 0");
-        assert_close(data[1], 3.0, 1e-5, "element 1");
-        assert_close(data[2], 4.0, 1e-5, "element 2");
+        assert_close(data[0], 2.0, BF16_TOL, "element 0");
+        assert_close(data[1], 3.0, BF16_TOL, "element 1");
+        assert_close(data[2], 4.0, BF16_TOL, "element 2");
     }
 
     #[test]
@@ -266,16 +276,16 @@ mod tests {
         // First vector [1, 2, 3]:
         // RMS = sqrt((1 + 4 + 9) / 3) = sqrt(14/3) ≈ 2.1602
         let rms1 = (14.0f32 / 3.0).sqrt();
-        assert_close(data[0], 1.0 / rms1, 1e-5, "batch 0, element 0");
-        assert_close(data[1], 2.0 / rms1, 1e-5, "batch 0, element 1");
-        assert_close(data[2], 3.0 / rms1, 1e-5, "batch 0, element 2");
+        assert_close(data[0], 1.0 / rms1, BF16_TOL, "batch 0, element 0");
+        assert_close(data[1], 2.0 / rms1, BF16_TOL, "batch 0, element 1");
+        assert_close(data[2], 3.0 / rms1, BF16_TOL, "batch 0, element 2");
 
         // Second vector [4, 5, 6]:
         // RMS = sqrt((16 + 25 + 36) / 3) = sqrt(77/3) ≈ 5.0664
         let rms2 = (77.0f32 / 3.0).sqrt();
-        assert_close(data[3], 4.0 / rms2, 1e-5, "batch 1, element 0");
-        assert_close(data[4], 5.0 / rms2, 1e-5, "batch 1, element 1");
-        assert_close(data[5], 6.0 / rms2, 1e-5, "batch 1, element 2");
+        assert_close(data[3], 4.0 / rms2, BF16_TOL, "batch 1, element 0");
+        assert_close(data[4], 5.0 / rms2, BF16_TOL, "batch 1, element 1");
+        assert_close(data[5], 6.0 / rms2, BF16_TOL, "batch 1, element 2");
     }
 
     #[test]
@@ -298,18 +308,18 @@ mod tests {
         // First vector [1, 2, 3, 4]:
         // RMS = sqrt((1 + 4 + 9 + 16) / 4) = sqrt(30/4) = sqrt(7.5) ≈ 2.7386
         let rms1 = (30.0f32 / 4.0).sqrt();
-        assert_close(data[0], 1.0 / rms1, 1e-5, "vec 0, elem 0");
-        assert_close(data[1], 2.0 / rms1, 1e-5, "vec 0, elem 1");
-        assert_close(data[2], 3.0 / rms1, 1e-5, "vec 0, elem 2");
-        assert_close(data[3], 4.0 / rms1, 1e-5, "vec 0, elem 3");
+        assert_close(data[0], 1.0 / rms1, BF16_TOL, "vec 0, elem 0");
+        assert_close(data[1], 2.0 / rms1, BF16_TOL, "vec 0, elem 1");
+        assert_close(data[2], 3.0 / rms1, BF16_TOL, "vec 0, elem 2");
+        assert_close(data[3], 4.0 / rms1, BF16_TOL, "vec 0, elem 3");
 
         // Second vector [5, 6, 7, 8]:
         // RMS = sqrt((25 + 36 + 49 + 64) / 4) = sqrt(174/4) = sqrt(43.5) ≈ 6.5955
         let rms2 = (174.0f32 / 4.0).sqrt();
-        assert_close(data[4], 5.0 / rms2, 1e-5, "vec 1, elem 0");
-        assert_close(data[5], 6.0 / rms2, 1e-5, "vec 1, elem 1");
-        assert_close(data[6], 7.0 / rms2, 1e-5, "vec 1, elem 2");
-        assert_close(data[7], 8.0 / rms2, 1e-5, "vec 1, elem 3");
+        assert_close(data[4], 5.0 / rms2, BF16_TOL, "vec 1, elem 0");
+        assert_close(data[5], 6.0 / rms2, BF16_TOL, "vec 1, elem 1");
+        assert_close(data[6], 7.0 / rms2, BF16_TOL, "vec 1, elem 2");
+        assert_close(data[7], 8.0 / rms2, BF16_TOL, "vec 1, elem 3");
     }
 
     #[test]
@@ -326,9 +336,9 @@ mod tests {
 
         // RMS = sqrt(0 + eps) = sqrt(1e-6) ≈ 1e-3
         // Normalized: [0/1e-3, 0/1e-3, 0/1e-3] = [0, 0, 0]
-        assert_close(data[0], 0.0, 1e-5, "element 0");
-        assert_close(data[1], 0.0, 1e-5, "element 1");
-        assert_close(data[2], 0.0, 1e-5, "element 2");
+        assert_close(data[0], 0.0, BF16_TOL, "element 0");
+        assert_close(data[1], 0.0, BF16_TOL, "element 1");
+        assert_close(data[2], 0.0, BF16_TOL, "element 2");
     }
 
     #[test]
@@ -383,8 +393,8 @@ mod tests {
         // RMS of [1, 1] is 1.0
         // Normalized: [1, 1]
         // Scaled by weight [2, 3]: [2, 3]
-        assert_close(data[0], 2.0, 1e-5, "element 0");
-        assert_close(data[1], 3.0, 1e-5, "element 1");
+        assert_close(data[0], 2.0, BF16_TOL, "element 0");
+        assert_close(data[1], 3.0, BF16_TOL, "element 1");
     }
 
     #[test]
@@ -401,9 +411,9 @@ mod tests {
 
         // RMS = sqrt((1e6 + 4e6 + 9e6) / 3) = sqrt(14e6/3) ≈ 2160.25
         let rms = ((1000.0f32 * 1000.0 + 2000.0 * 2000.0 + 3000.0 * 3000.0) / 3.0).sqrt();
-        assert_close(data[0], 1000.0 / rms, 1e-3, "element 0");
-        assert_close(data[1], 2000.0 / rms, 1e-3, "element 1");
-        assert_close(data[2], 3000.0 / rms, 1e-3, "element 2");
+        assert_close(data[0], 1000.0 / rms, BF16_TOL, "element 0");
+        assert_close(data[1], 2000.0 / rms, BF16_TOL, "element 1");
+        assert_close(data[2], 3000.0 / rms, BF16_TOL, "element 2");
 
         // Verify output is finite (no overflow/NaN)
         assert!(data.iter().all(|&x| x.is_finite()));
@@ -423,9 +433,9 @@ mod tests {
 
         // RMS = sqrt((1 + 4 + 9) / 3) = sqrt(14/3) ≈ 2.1602
         let rms = (14.0f32 / 3.0).sqrt();
-        assert_close(data[0], -1.0 / rms, 1e-5, "element 0");
-        assert_close(data[1], 2.0 / rms, 1e-5, "element 1");
-        assert_close(data[2], -3.0 / rms, 1e-5, "element 2");
+        assert_close(data[0], -1.0 / rms, BF16_TOL, "element 0");
+        assert_close(data[1], 2.0 / rms, BF16_TOL, "element 1");
+        assert_close(data[2], -3.0 / rms, BF16_TOL, "element 2");
     }
 
     #[test]
