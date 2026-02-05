@@ -149,14 +149,22 @@ static GPU_CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
 /// }
 /// ```
 pub fn get_context() -> Result<&'static GpuContext> {
+    let profiling_enabled = std::env::var("PROFILE").is_ok();
+
     GPU_CONTEXT
         .get_or_init(|| match init() {
             Ok(ctx) => {
-                eprintln!("GPU initialized: {:?}", ctx.adapter_info().name);
+                let info = ctx.adapter_info();
+                eprintln!("[GPU] GPU initialized: {} ({:?})", info.name, info.backend);
+                if profiling_enabled {
+                    eprintln!("[GPU]   Device: {:?}", info.device_type);
+                    eprintln!("[GPU]   Driver: {}", info.driver);
+                    eprintln!("[GPU]   Driver version: {}", info.driver_info);
+                }
                 Some(ctx)
             }
             Err(e) => {
-                eprintln!("GPU init failed: {}, falling back to CPU", e);
+                eprintln!("[GPU] GPU init failed: {}, falling back to CPU", e);
                 None
             }
         })

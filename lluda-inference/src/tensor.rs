@@ -783,9 +783,33 @@ impl Tensor {
         #[cfg(feature = "gpu")]
         {
             if self.is_gemv_candidate(rhs) {
+                let profiling_enabled = std::env::var("PROFILE").is_ok();
+                if profiling_enabled {
+                    eprintln!(
+                        "[GPU] GEMV candidate detected: {}x{} @ {}x{}",
+                        lhs_shape[0], lhs_shape[1], rhs_shape[0], 1
+                    );
+                    eprintln!("[GPU]   LHS dtype: {:?}, RHS dtype: {:?}", self.dtype(), rhs.dtype());
+                }
+
                 // Try GPU acceleration if both tensors are BF16 and size is large enough
-                if let Ok(result) = self.try_gemv_gpu(rhs) {
-                    return Ok(result);
+                let gpu_start = std::time::Instant::now();
+                match self.try_gemv_gpu(rhs) {
+                    Ok(result) => {
+                        if profiling_enabled {
+                            eprintln!(
+                                "[GPU]   GPU path SUCCESS: {:.2}ms",
+                                gpu_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        if profiling_enabled {
+                            eprintln!("[GPU]   GPU path FAILED: {}", e);
+                            eprintln!("[GPU]   Falling back to CPU");
+                        }
+                    }
                 }
                 // If GPU fails, fall through to CPU implementation
             }
@@ -880,11 +904,21 @@ impl Tensor {
     /// - Inner dimensions match
     #[cfg(feature = "gpu")]
     fn is_gemv_candidate(&self, rhs: &Tensor) -> bool {
+        let profiling_enabled = std::env::var("PROFILE").is_ok();
         let lhs_shape = self.shape();
         let rhs_shape = rhs.shape();
 
         // LHS must be 2D, RHS must be 1D
         if lhs_shape.len() != 2 || rhs_shape.len() != 1 {
+            if profiling_enabled {
+                eprintln!(
+                    "[GPU] GEMV rejected: shape mismatch (need 2D×1D, got {}D×{}D): {:?} × {:?}",
+                    lhs_shape.len(),
+                    rhs_shape.len(),
+                    lhs_shape,
+                    rhs_shape
+                );
+            }
             return false;
         }
 
@@ -892,7 +926,24 @@ impl Tensor {
         let k = lhs_shape[1];
         let n = rhs_shape[0];
 
-        k == n
+        if k != n {
+            if profiling_enabled {
+                eprintln!(
+                    "[GPU] GEMV rejected: inner dimension mismatch ({}×{} @ {})",
+                    lhs_shape[0], k, n
+                );
+            }
+            return false;
+        }
+
+        if profiling_enabled {
+            eprintln!(
+                "[GPU] GEMV candidate ACCEPTED: {}×{} @ {}",
+                lhs_shape[0], k, n
+            );
+        }
+
+        true
     }
 
     /// Try to execute GEMV on GPU.
@@ -903,6 +954,8 @@ impl Tensor {
     fn try_gemv_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
         use crate::gpu;
 
+        let profiling_enabled = std::env::var("PROFILE").is_ok();
+
         // Both tensors must be BF16
         if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
             return Err(LludaError::Msg("GPU GEMV requires BF16 tensors".into()));
@@ -912,19 +965,46 @@ impl Tensor {
         let m = self.shape()[0];
         let n = self.shape()[1];
         if m * n <= 1024 {
+            if profiling_enabled {
+                eprintln!(
+                    "[GPU]   Matrix too small for GPU: {}x{} ({})",
+                    m, n, m * n
+                );
+            }
             return Err(LludaError::Msg("Matrix too small for GPU acceleration".into()));
         }
 
         // Get GPU context (initialized on first use)
+        let ctx_start = std::time::Instant::now();
         let ctx = gpu::get_context()?;
+        if profiling_enabled {
+            eprintln!(
+                "[GPU]   Get context: {:.2}ms",
+                ctx_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         // Execute GEMV on GPU
+        let gemv_start = std::time::Instant::now();
         let result = gpu::gemv::gemv_forward(ctx, self, rhs)?;
+        if profiling_enabled {
+            eprintln!(
+                "[GPU]   GEMV forward (upload+compute+download): {:.2}ms",
+                gemv_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         // Convert result to F32 for consistency with CPU path
         // (All compute operations return F32 in Phase 0)
+        let convert_start = std::time::Instant::now();
         let result_bf16 = result.to_vec_bf16();
         let result_f32: Vec<f32> = result_bf16.iter().map(|&bf| bf.into()).collect();
+        if profiling_enabled {
+            eprintln!(
+                "[GPU]   BF16 -> F32 conversion: {:.2}ms",
+                convert_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Tensor::new(result_f32, vec![m])
     }

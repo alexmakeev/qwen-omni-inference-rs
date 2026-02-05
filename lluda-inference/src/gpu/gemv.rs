@@ -299,6 +299,9 @@ pub fn gemv_forward(
     use crate::bf16::BF16;
     use crate::tensor::DType;
 
+    let profiling_enabled = std::env::var("PROFILE").is_ok();
+    let total_start = std::time::Instant::now();
+
     // Validate shapes
     let matrix_shape = matrix.shape();
     let vector_shape = vector.shape();
@@ -342,14 +345,29 @@ pub fn gemv_forward(
     }
 
     // Extract BF16 data
+    let extract_start = std::time::Instant::now();
     let matrix_data = matrix.to_vec_bf16();
     let vector_data = vector.to_vec_bf16();
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Extract BF16 data: {:.2}ms",
+            extract_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Pack BF16 data (2 values per u32)
+    let pack_start = std::time::Instant::now();
     let matrix_packed = pack_bf16(&matrix_data);
     let vector_packed = pack_bf16(&vector_data);
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Pack BF16 data: {:.2}ms",
+            pack_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Create GPU buffers
+    let buffer_create_start = std::time::Instant::now();
     let matrix_bytes: Vec<u8> = matrix_packed
         .iter()
         .flat_map(|u| u.to_le_bytes())
@@ -365,17 +383,12 @@ pub fn gemv_forward(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    ctx.queue().write_buffer(&matrix_buf, 0, &matrix_bytes);
-
     let vector_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("gemv-vector"),
         size: vector_bytes.len() as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    ctx.queue().write_buffer(&vector_buf, 0, &vector_bytes);
-
-    // Create output buffer (unpacked: one u32 per BF16)
     let output_size = (m * 4) as u64;
     let output_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("gemv-output"),
@@ -385,9 +398,37 @@ pub fn gemv_forward(
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Create buffers: {:.2}ms",
+            buffer_create_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    // Upload data to GPU
+    let upload_start = std::time::Instant::now();
+    ctx.queue().write_buffer(&matrix_buf, 0, &matrix_bytes);
+    ctx.queue().write_buffer(&vector_buf, 0, &vector_bytes);
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Upload to GPU ({} + {} bytes): {:.2}ms",
+            matrix_bytes.len(),
+            vector_bytes.len(),
+            upload_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Create pipeline and execute
+    let pipeline_start = std::time::Instant::now();
     let pipeline = GemvPipeline::new(ctx)?;
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Create pipeline: {:.2}ms",
+            pipeline_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    let execute_start = std::time::Instant::now();
     pipeline.execute(
         ctx,
         &matrix_buf,
@@ -396,11 +437,25 @@ pub fn gemv_forward(
         m as u32,
         k as u32,
     )?;
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Submit GPU kernel: {:.2}ms",
+            execute_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Wait for GPU completion
+    let wait_start = std::time::Instant::now();
     let _ = ctx.device().poll(wgpu::PollType::wait_indefinitely());
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Wait for GPU completion: {:.2}ms",
+            wait_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Read back results
+    let download_start = std::time::Instant::now();
     let staging_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("gemv-staging"),
         size: output_size,
@@ -429,8 +484,16 @@ pub fn gemv_forward(
     let output_bytes: Vec<u8> = data.to_vec();
     drop(data);
     staging_buf.unmap();
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Download from GPU ({} bytes): {:.2}ms",
+            output_bytes.len(),
+            download_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Unpack output (one u32 per BF16, value in low 16 bits)
+    let unpack_start = std::time::Instant::now();
     let output_u32s: Vec<u32> = output_bytes
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -440,6 +503,16 @@ pub fn gemv_forward(
         .iter()
         .map(|u| BF16::from_bits((u & 0xFFFF) as u16))
         .collect();
+    if profiling_enabled {
+        eprintln!(
+            "[GPU]     Unpack output: {:.2}ms",
+            unpack_start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[GPU]     Total GPU operation time: {:.2}ms",
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     // Return as BF16 tensor with shape [M]
     crate::tensor::Tensor::from_bf16(output_bf16, vec![m])
