@@ -13,6 +13,10 @@ pub mod config;
 pub mod tokenizer;
 pub mod loader;
 
+// Phase 1: GPU acceleration (optional feature)
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 // Model components
 pub mod embedding;
 pub mod rms_norm;
