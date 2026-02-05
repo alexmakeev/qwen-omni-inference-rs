@@ -200,3 +200,118 @@ Ensure you have read permissions on the reference_data directory.
 - `tests/validation.rs` - Integration test version of validation
 - `scripts/extract_reference.py` - T21 reference data extraction
 - `docs/architecture/phase0-implementation-plan.md` - T22 specification
+
+---
+
+## `benchmark_inference.rs` - Inference Performance Benchmark
+
+Comprehensive benchmark for measuring inference throughput (tokens/sec) on CPU vs GPU.
+
+### Purpose
+
+This benchmark measures:
+1. Inference speed in tokens/sec for both CPU and GPU modes
+2. Generated text quality (verifies CPU and GPU produce identical outputs)
+3. Performance baseline for optimization efforts
+
+### Usage
+
+#### Run CPU Benchmark
+
+```bash
+cargo run --example benchmark_inference --release
+```
+
+#### Run GPU Benchmark
+
+```bash
+cargo run --features gpu --example benchmark_inference --release
+```
+
+#### Run Automated Comparison
+
+```bash
+./run_benchmark_comparison.sh
+```
+
+This script runs both CPU and GPU benchmarks and generates a comparison report.
+
+### Output
+
+```
+=== Qwen3-0.6B Inference Benchmark ===
+
+Mode: GPU
+Model: ../models/Qwen3-0.6B
+Prompt: "The capital of France is"
+Tokens to generate: 50
+
+Loading model...
+Model loaded in 5.76s (28 layers, vocab_size=151936)
+
+Warmup: generating 1 token...
+Warmup complete
+
+Benchmarking generation of 50 tokens...
+
+=== Benchmark Results ===
+
+Generation time: 469.335s
+Tokens/sec: 0.11
+
+=== Generated Text ===
+
+The capital of France is Paris. Paris. Paris Paris...
+
+=== Token Statistics ===
+
+Prompt tokens: 5
+Generated tokens: 50
+Total tokens: 55
+
+=== Summary ===
+
+Mode: GPU
+Performance: 0.11 tokens/sec
+Average time per token: 9387ms
+
+GPU acceleration enabled via --features gpu
+
+Benchmark complete!
+```
+
+### Benchmark Configuration
+
+- **Model:** Qwen3-0.6B
+- **Prompt:** "The capital of France is" (5 tokens)
+- **Generation length:** 50 tokens
+- **Sampling:** Greedy (temperature=0.0) for deterministic comparison
+- **Warmup:** 1 token generated before benchmark to initialize caches
+
+### Performance Metrics
+
+- **Tokens/sec:** Primary throughput metric
+- **Generation time:** Total time for generating 50 tokens
+- **Time per token:** Average latency per token
+
+### Quality Verification
+
+The benchmark uses greedy sampling (deterministic) to ensure:
+- CPU and GPU produce **identical** generated text
+- Verifies correctness of GPU implementation
+- No numerical precision issues
+
+### Results Interpretation
+
+See `BENCHMARK_RESULTS.md` for detailed analysis of CPU vs GPU performance.
+
+Key findings:
+- Current GPU implementation (GEMV-only) is slightly slower than CPU for small models
+- Generated texts are identical (confirms correctness)
+- Full GPU pipeline (attention, MLP on GPU) needed for significant speedup
+
+### See Also
+
+- `BENCHMARK_RESULTS.md` - Detailed benchmark results and analysis
+- `run_benchmark_comparison.sh` - Automated CPU vs GPU comparison script
+- `benchmark_gemv.rs` - Low-level GEMV operation benchmark
