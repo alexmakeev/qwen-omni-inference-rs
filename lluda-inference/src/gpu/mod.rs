@@ -17,6 +17,7 @@
 //! ```
 
 pub mod buffer;
+pub mod gemm;
 pub mod gemv;
 
 use crate::error::{LludaError, Result};
