@@ -1162,3 +1162,51 @@ Results:
 Analysis: GPU no speedup due to GEMV-only acceleration
 Next: Full GPU pipeline (T27-T29) or quantization for real gains
 
+## 2026-02-05 03:30
+Done: Root cause found - GPU not used (GEMV vs GEMM mismatch)
+Decision: Implement GEMM kernel (2D×2D matrix-matrix multiply)
+Starting: T27 - GEMM compute shader for real GPU acceleration
+Expected: 5-10x speedup once implemented
+
+## 2026-02-05 03:51
+Done: T27 complete - GEMM shader implemented
+Done: Removed ALL GPU fallbacks - strict GPU-or-fail policy
+Principle: NO SILENT FALLBACKS - либо GPU работает, либо падает с ошибкой
+
+Changes:
+- GEMM 2D×2D working for BF16×BF16
+- Strict matmul_gpu/matmul_cpu separation
+- Clear errors instead of silent fallback
+- -237 lines of fallback logic
+
+Current issue: Model uses F32 weights, GPU requires BF16
+Next: Convert model to BF16 for real GPU acceleration
+
+## 2026-02-05 10:24
+Done: Phase 1 GPU - 90% complete, bead created
+Status saved to: beads/phase1-gpu-acceleration.md
+
+Achievements:
+- GPU infrastructure complete (T23-T27)
+- GEMM shader working on Luda (BF16×BF16)
+- All fallbacks removed, BF16 native pipeline
+- GPU validated: 15.68ms, 2.39ms, 1.62ms timing
+
+Next (when resume): T28 - Reshape 4D→2D for attention ops
+
+Ready to switch to other task
+
+
+## 2026-02-05 11:10
+--- COMPACTING (auto) ---
+
+## 2026-02-05 11:30
+Done: Research: Huawei SFP adapter setup for Rostelecom GPON
+Explored: Serial number configuration, MAC address, VLAN parameters, compatible modules
+Key findings:
+- MA5671A: professional option, requires SSH/telnet config via fw_setenv
+- DFP-34G-2C2: user-friendly, web interface at 192.168.1.1
+- Rostelecom: SN registration required, VLAN ID region-specific
+- Keenetic Giga: full SFP compatibility, no restrictions
+
+Next: Complete research report with practical recommendations

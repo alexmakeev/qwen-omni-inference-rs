@@ -863,11 +863,31 @@ impl Tensor {
             return Ok(result);
         }
 
+        // Check 4D × 4D batched GEMM
+        if lhs_shape.len() == 4 && rhs_shape.len() == 4 {
+            if profiling {
+                eprintln!(
+                    "[GPU] matmul dispatch: [{}×{}×{}×{}] @ [{}×{}×{}×{}] (4D batched GEMM)",
+                    lhs_shape[0], lhs_shape[1], lhs_shape[2], lhs_shape[3],
+                    rhs_shape[0], rhs_shape[1], rhs_shape[2], rhs_shape[3],
+                );
+                eprintln!("[GPU]   dtype: {:?}×{:?}", self.dtype(), rhs.dtype());
+            }
+            let start = std::time::Instant::now();
+            let result = self.matmul_batched_4d_gpu(rhs)?;
+            if profiling {
+                eprintln!(
+                    "[GPU]   4D batched GEMM execution: {:.2}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(result);
+        }
+
         // Unsupported shape in GPU mode
         Err(LludaError::Msg(format!(
             "GPU mode: unsupported matmul shapes {}D×{}D. \
-             Only 2D×2D (GEMM) and 2D×1D (GEMV) are supported on GPU. \
-             Use CPU mode (remove --features gpu) for batched operations (3D, 4D).",
+             Only 2D×2D (GEMM), 2D×1D (GEMV), and 4D×4D (batched GEMM) are supported on GPU.",
             lhs_shape.len(),
             rhs_shape.len()
         )))
@@ -1080,6 +1100,100 @@ impl Tensor {
 
         // Keep result in BF16 - no conversion!
         Ok(result)
+    }
+
+    /// Execute batched 4D matmul on GPU via looping over 2D GEMM slices.
+    ///
+    /// Handles [B, H, M, K] @ [B, H, K, N] -> [B, H, M, N] by splitting
+    /// the 4D tensors into B*H independent 2D [M,K]×[K,N] GEMM calls.
+    ///
+    /// Requirements:
+    /// - Both LHS and RHS must be 4D
+    /// - Batch (B) and heads (H) dims must match
+    /// - Inner dimension K must match
+    /// - Both tensors must be BF16
+    ///
+    /// Returns error if requirements not met (no CPU fallback).
+    #[cfg(feature = "gpu")]
+    fn matmul_batched_4d_gpu(&self, rhs: &Tensor) -> Result<Tensor> {
+        let lhs_shape = self.shape();
+        let rhs_shape = rhs.shape();
+
+        // Extract [B, H, M, K] and [B2, H2, K2, N]
+        let batch = lhs_shape[0];
+        let heads = lhs_shape[1];
+        let m = lhs_shape[2];
+        let k = lhs_shape[3];
+        let b2 = rhs_shape[0];
+        let h2 = rhs_shape[1];
+        let k2 = rhs_shape[2];
+        let n = rhs_shape[3];
+
+        // Validate batch dimensions match
+        if batch != b2 {
+            return Err(LludaError::Msg(format!(
+                "GPU 4D batched matmul: batch dimension mismatch: {} != {}",
+                batch, b2
+            )));
+        }
+
+        // Validate head dimensions match
+        if heads != h2 {
+            return Err(LludaError::Msg(format!(
+                "GPU 4D batched matmul: heads dimension mismatch: {} != {}",
+                heads, h2
+            )));
+        }
+
+        // Validate inner dimensions match
+        if k != k2 {
+            return Err(LludaError::Msg(format!(
+                "GPU 4D batched matmul: inner dimension mismatch: K={} vs K={}",
+                k, k2
+            )));
+        }
+
+        // Strict dtype requirement: both must be BF16
+        if self.dtype() != DType::BF16 || rhs.dtype() != DType::BF16 {
+            return Err(LludaError::Msg(format!(
+                "GPU 4D batched matmul requires BF16 tensors, got {:?}×{:?}. \
+                 Convert tensors to BF16 before GPU operations.",
+                self.dtype(),
+                rhs.dtype()
+            )));
+        }
+
+        // Extract raw BF16 data from both tensors (must be CPU-side)
+        let lhs_data = self.to_vec_bf16();
+        let rhs_data = rhs.to_vec_bf16();
+
+        let lhs_slice_size = m * k; // size of one [M, K] slice
+        let rhs_slice_size = k * n; // size of one [K, N] slice
+        let out_slice_size = m * n; // size of one [M, N] result
+
+        let num_batches = batch * heads;
+        let mut output_data: Vec<BF16> = Vec::with_capacity(num_batches * out_slice_size);
+
+        // Loop over all (batch, head) combinations
+        for bh in 0..num_batches {
+            let lhs_offset = bh * lhs_slice_size;
+            let rhs_offset = bh * rhs_slice_size;
+
+            // Create 2D tensors [M, K] and [K, N] for this slice
+            let lhs_slice =
+                Tensor::from_bf16(lhs_data[lhs_offset..lhs_offset + lhs_slice_size].to_vec(), vec![m, k])?;
+            let rhs_slice =
+                Tensor::from_bf16(rhs_data[rhs_offset..rhs_offset + rhs_slice_size].to_vec(), vec![k, n])?;
+
+            // Execute 2D GEMM on GPU - returns BF16 tensor [M, N]
+            let result_slice = lhs_slice.matmul_gemm_gpu(&rhs_slice)?;
+
+            // Collect BF16 output
+            output_data.extend(result_slice.to_vec_bf16());
+        }
+
+        // Assemble final tensor [B, H, M, N]
+        Tensor::from_bf16(output_data, vec![batch, heads, m, n])
     }
 
 
@@ -5365,5 +5479,150 @@ mod tests {
             "GEMM integration test passed: {}×{} @ {}×{} = {}×{}",
             m, k, k, n, m, n
         );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn test_matmul_batched_4d_gpu_integration() {
+        // Test 4D batched matmul on GPU: [B, H, M, K] @ [B, H, K, N] -> [B, H, M, N]
+        // Mirrors attention pattern: Q @ K^T and attn_weights @ V
+
+        // Skip if GPU not available
+        if crate::gpu::get_context().is_err() {
+            println!("Skipping GPU 4D batched matmul test: No GPU available");
+            return;
+        }
+
+        // Shape similar to attention with small values for fast test
+        // [1, 2, 3, 4] @ [1, 2, 4, 2] -> [1, 2, 3, 2]
+        let batch = 1;
+        let heads = 2;
+        let m = 3;
+        let k = 4;
+        let n = 2;
+
+        // Head 0: A = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]
+        // Head 1: A = [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
+        let a_data: Vec<BF16> = vec![
+            // head 0
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            // head 1
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ]
+        .iter()
+        .map(|&x| BF16::from(x as f32))
+        .collect();
+
+        // Head 0: B = [[1,2],[3,4],[5,6],[7,8]]
+        // Head 1: B = [[1,1],[2,2],[3,3],[4,4]]
+        let b_data: Vec<BF16> = vec![
+            // head 0
+            1.0, 2.0,
+            3.0, 4.0,
+            5.0, 6.0,
+            7.0, 8.0,
+            // head 1
+            1.0, 1.0,
+            2.0, 2.0,
+            3.0, 3.0,
+            4.0, 4.0,
+        ]
+        .iter()
+        .map(|&x| BF16::from(x as f32))
+        .collect();
+
+        let a = Tensor::from_bf16(a_data, vec![batch, heads, m, k]).unwrap();
+        let b = Tensor::from_bf16(b_data, vec![batch, heads, k, n]).unwrap();
+
+        let c = a.matmul(&b).unwrap();
+
+        // Validate shape
+        assert_eq!(c.shape(), &[batch, heads, m, n]);
+        assert_eq!(c.dtype(), DType::BF16);
+
+        let result = c.to_vec_f32();
+
+        // Head 0 expected:
+        // row 0: [1*1+2*3+3*5+4*7, 1*2+2*4+3*6+4*8] = [50, 60]
+        // row 1: [5*1+6*3+7*5+8*7, 5*2+6*4+7*6+8*8] = [114, 140]
+        // row 2: [9*1+10*3+11*5+12*7, 9*2+10*4+11*6+12*8] = [178, 220]
+        // Head 1 expected (identity-like rows):
+        // row 0: [1*1+0*2+0*3+0*4, 1*1+0*2+0*3+0*4] = [1, 1]
+        // row 1: [0*1+1*2+0*3+0*4, 0*1+1*2+0*3+0*4] = [2, 2]
+        // row 2: [0*1+0*2+1*3+0*4, 0*1+0*2+1*3+0*4] = [3, 3]
+        let tolerance = 1.0f32; // BF16 accumulation tolerance
+
+        let expected = vec![
+            50.0f32, 60.0, 114.0, 140.0, 178.0, 220.0, // head 0
+            1.0, 1.0, 2.0, 2.0, 3.0, 3.0,              // head 1
+        ];
+
+        assert_eq!(result.len(), expected.len());
+        for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
+            let diff = (got - exp).abs();
+            assert!(
+                diff <= tolerance,
+                "Element {} mismatch: got {}, expected {}, diff {}",
+                i,
+                got,
+                exp,
+                diff
+            );
+        }
+
+        println!("GPU 4D batched matmul integration test passed: [{},{},{},{}] @ [{},{},{},{}]",
+            batch, heads, m, k, batch, heads, k, n);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn test_matmul_batched_4d_gpu_shape_mismatch() {
+        // Skip if GPU not available
+        if crate::gpu::get_context().is_err() {
+            println!("Skipping GPU 4D shape mismatch test: No GPU available");
+            return;
+        }
+
+        // Batch mismatch: [2, 2, 2, 3] @ [1, 2, 3, 2]
+        let a = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 24],
+            vec![2, 2, 2, 3],
+        ).unwrap();
+        let b = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 12],
+            vec![1, 2, 3, 2],
+        ).unwrap();
+        let result = a.matmul(&b);
+        assert!(result.is_err(), "Should fail on batch mismatch");
+
+        // Heads mismatch: [1, 4, 2, 3] @ [1, 2, 3, 2]
+        let a = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 24],
+            vec![1, 4, 2, 3],
+        ).unwrap();
+        let b = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 12],
+            vec![1, 2, 3, 2],
+        ).unwrap();
+        let result = a.matmul(&b);
+        assert!(result.is_err(), "Should fail on heads mismatch");
+
+        // Inner dim mismatch: [1, 2, 2, 3] @ [1, 2, 4, 2]
+        let a = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 12],
+            vec![1, 2, 2, 3],
+        ).unwrap();
+        let b = Tensor::from_bf16(
+            vec![BF16::from(1.0f32); 16],
+            vec![1, 2, 4, 2],
+        ).unwrap();
+        let result = a.matmul(&b);
+        assert!(result.is_err(), "Should fail on inner dim mismatch");
+
+        println!("GPU 4D batched matmul shape mismatch test passed");
     }
 }
