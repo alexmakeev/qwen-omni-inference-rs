@@ -1210,3 +1210,25 @@ Key findings:
 - Keenetic Giga: full SFP compatibility, no restrictions
 
 Next: Complete research report with practical recommendations
+
+## 2026-02-18 ~05:00
+Done: T28 4D batched matmul для attention — реализован и закоммичен
+- matmul_batched_4d_gpu(): цикл по B*H слайсам через 2D GEMM
+- 414 тестов pass, 0 failed, clippy чисто
+- CPU inference проверен: "The capital of France is Paris" — корректно
+- CPU скорость: 0.16 tok/s (6.4s/token) на dev-сервере (не Luda)
+
+Plan: Проверка на Luda (железо)
+- Запустить GPU inference на Luda с Vulkan/AMD RDNA 3.5
+- Замерить tok/s с T28 (4D matmul через GPU) vs без
+- Ожидание: 5-10x ускорение над CPU (0.21 tok/s → 1-2 tok/s)
+- Phase 1 GPU будет ~100% после успешного теста на железе
+
+Plan: Q8_0 квантизация (новая ветка q8-quantization)
+- Переход на worktree структуру: /home/alexmak/lluda-ws/{main,q8,...}
+- Цель: Q8_0 (8-bit) квантизация весов для уменьшения памяти
+- Qwen3-0.6B: 1.4GB → ~0.7GB (тестовая модель)
+- Qwen3-Omni 30B: ~60GB → ~30GB (целевая модель)
+- Это Phase 2 из общего плана
+
+Next: Создать worktree q8, начать планирование Q8_0 квантизации
