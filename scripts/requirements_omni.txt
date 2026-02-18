@@ -1,0 +1,6 @@
+transformers>=4.57.3
+accelerate
+soundfile
+librosa
+huggingface-hub
+qwen-omni-utils
