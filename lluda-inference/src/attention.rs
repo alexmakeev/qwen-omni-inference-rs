@@ -136,6 +136,120 @@ impl Linear {
     }
 }
 
+/// Linear layer with Q8_0 quantized weights.
+///
+/// Weights are stored as Q8_0 blocks in [out_features, in_features] layout.
+/// Uses fused matmul_f32_x_quant — no dequantization during inference.
+pub struct Q8Linear {
+    /// Q8_0 quantized weight blocks, [out_features, in_features] layout
+    /// Stored as out_features rows of (in_features/32) blocks each
+    weight_blocks: Vec<crate::quant::Q8Block>,
+    out_features: usize,
+    in_features: usize,
+}
+
+impl Q8Linear {
+    /// Create from raw Q8_0 blocks.
+    ///
+    /// `blocks` must contain `out_features * ceil(in_features / 32)` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if the number of blocks doesn't match the expected count.
+    pub fn from_blocks(
+        blocks: Vec<crate::quant::Q8Block>,
+        out_features: usize,
+        in_features: usize,
+    ) -> crate::error::Result<Self> {
+        let blocks_per_row = (in_features + 31) / 32;
+        let expected_blocks = out_features * blocks_per_row;
+        if blocks.len() != expected_blocks {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![expected_blocks],
+                got: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            weight_blocks: blocks,
+            out_features,
+            in_features,
+        })
+    }
+
+    /// Create from a Tensor with Q8_0 dtype.
+    ///
+    /// The tensor must be 2D with shape [out_features, in_features].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if tensor is not 2D.
+    /// Returns `DTypeMismatch` if tensor dtype is not Q8_0.
+    pub fn new(weight: crate::tensor::Tensor) -> crate::error::Result<Self> {
+        use crate::tensor::DType;
+        if weight.ndim() != 2 {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![0, 0],
+                got: weight.shape().to_vec(),
+            });
+        }
+        if weight.dtype() != DType::Q8_0 {
+            return Err(crate::error::LludaError::DTypeMismatch {
+                expected: "Q8_0".to_string(),
+                got: weight.dtype().to_string(),
+            });
+        }
+        let out_features = weight.shape()[0];
+        let in_features = weight.shape()[1];
+        let blocks = weight.into_q8_blocks()?;
+        Self::from_blocks(blocks, out_features, in_features)
+    }
+
+    /// Forward pass: x[..., in_features] -> out[..., out_features]
+    ///
+    /// Accepts any tensor with last dimension equal to `in_features`.
+    /// Leading dimensions are treated as a batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if the input is empty or if the last dimension
+    /// doesn't match `in_features`.
+    pub fn forward(&self, x: &crate::tensor::Tensor) -> crate::error::Result<crate::tensor::Tensor> {
+        let x_shape = x.shape().to_vec();
+        let last_dim = *x_shape.last().ok_or_else(|| {
+            crate::error::LludaError::ShapeMismatch {
+                expected: vec![self.in_features],
+                got: vec![],
+            }
+        })?;
+
+        if last_dim != self.in_features {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![self.in_features],
+                got: vec![last_dim],
+            });
+        }
+
+        // Flatten to 2D: [batch, in_features]
+        let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
+        let x_f32 = x.to_vec_f32();
+
+        // Fused Q8 matmul: [batch, K] x [N, K/32 blocks] -> [batch, N]
+        let out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q8Block>(
+            &x_f32,
+            &self.weight_blocks,
+            batch,
+            self.in_features,
+            self.out_features,
+        );
+
+        // Reshape output to [..., out_features]
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(self.out_features);
+
+        crate::tensor::Tensor::new(out_data, out_shape)
+    }
+}
+
 /// Grouped Query Attention with per-head Q/K normalization.
 ///
 /// Key features:

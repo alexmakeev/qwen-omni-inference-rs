@@ -237,6 +237,21 @@ impl Tensor {
         })
     }
 
+    /// Consume tensor and extract Q8_0 blocks. Returns error if tensor is not Q8_0.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DTypeMismatch` if tensor dtype is not Q8_0.
+    pub fn into_q8_blocks(self) -> Result<Vec<Q8Block>> {
+        match self.data {
+            TensorData::Q8_0 { blocks, .. } => Ok(blocks),
+            _ => Err(LludaError::DTypeMismatch {
+                expected: "Q8_0".to_string(),
+                got: self.data.dtype().to_string(),
+            }),
+        }
+    }
+
     /// Convert tensor to a different data type.
     ///
     /// Creates a new tensor with data converted to the target dtype.

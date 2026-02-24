@@ -25,6 +25,7 @@ use safetensors::SafeTensors;
 
 use crate::bf16::BF16;
 use crate::error::{LludaError, Result};
+use crate::quant::quantize_f32_to_q8;
 use crate::tensor::Tensor;
 
 /// Container for model weights loaded from SafeTensors format.
@@ -83,6 +84,89 @@ impl ModelWeights {
         for (name, view) in tensors.tensors() {
             let tensor = load_tensor(&view)?;
             weights.insert(name.to_string(), tensor);
+        }
+
+        Ok(Self {
+            weights,
+            mmap,
+        })
+    }
+
+    /// Load model weights from SafeTensors, quantizing 2D weight tensors to Q8_0.
+    ///
+    /// This loads the model in BF16 format and then quantizes all 2D weight
+    /// tensors (linear layer projections) to Q8_0 format. 1D tensors (norms,
+    /// biases) and embeddings stay in their original format.
+    ///
+    /// The quantization process for each 2D weight tensor:
+    /// 1. BF16 → F32 conversion
+    /// 2. Quantize F32 to Q8_0 blocks (layout stays [out_features, in_features])
+    ///
+    /// The stored Q8_0 tensor uses the [out_features, in_features] layout which
+    /// matches what `matmul_f32_x_quant` expects: W[N, K/32 blocks] where
+    /// N = out_features, K = in_features.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the .safetensors file
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - File not found or cannot be opened
+    /// - Invalid SafeTensors format
+    /// - Unsupported data type (only BF16 and F32 are supported)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::loader::ModelWeights;
+    ///
+    /// let weights = ModelWeights::from_safetensors_q8("models/Qwen3-0.6B/model.safetensors")?;
+    /// println!("Loaded {} tensors (2D weights quantized to Q8_0)", weights.len());
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn from_safetensors_q8(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+
+        // Memory-map the file (don't load 1.5GB into RAM)
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+
+        // Parse SafeTensors header and metadata
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| LludaError::SafeTensors(format!("Failed to parse SafeTensors: {}", e)))?;
+
+        let mut weights = HashMap::new();
+
+        for (name, view) in tensors.tensors() {
+            let shape = view.shape().to_vec();
+
+            // Quantize 2D weight tensors to Q8_0, excluding embeddings and norms.
+            // Embeddings are lookup tables — quantizing them would require dequant
+            // on every token lookup. Norms are 1D and tiny; no gain from quantizing.
+            let is_2d_linear_weight = shape.len() == 2
+                && name.contains("weight")
+                && !name.contains("embed_tokens")
+                && !name.contains("norm");
+
+            if is_2d_linear_weight {
+                // Load BF16/F32 tensor then convert to f32 for quantization
+                let tensor = load_tensor(&view)?;
+                let f32_data = tensor.to_vec_f32();
+                let numel = shape.iter().product::<usize>();
+
+                // Quantize to Q8_0 blocks. Layout stays [out_features, in_features],
+                // which is what matmul_f32_x_quant expects as W[N, K/32 blocks].
+                let blocks = quantize_f32_to_q8(&f32_data);
+                let q8_tensor = Tensor::from_q8_blocks(blocks, numel, shape)?;
+                weights.insert(name.to_string(), q8_tensor);
+            } else {
+                // Keep 1D tensors, embeddings, and non-weight tensors in original format
+                let tensor = load_tensor(&view)?;
+                weights.insert(name.to_string(), tensor);
+            }
         }
 
         Ok(Self {
