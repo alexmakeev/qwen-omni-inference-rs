@@ -1232,3 +1232,21 @@ Plan: Q8_0 квантизация (новая ветка q8-quantization)
 - Это Phase 2 из общего плана
 
 Next: Создать worktree q8, начать планирование Q8_0 квантизации
+
+## 2026-02-24 20:00
+Done: Q8_0 Quantization — Phase 1-5 implementation complete
+- Phase 2: QuantBlock trait + Q8Block + FP16 helpers (quant.rs, 736 lines)
+- Phase 3: Fused matmul_f32_x_quant — NO dequantization during compute
+- Phase 4: Loader (from_safetensors_q8, multi-shard support) + Q8Linear + AnyLinear enum wiring through model
+- Phase 1: Python reference script (--quantize q8 flag)
+- Phase 5: Validated on real Qwen2.5-Omni-3B weights — 502 layers, avg MSE=1.24e-8, min cosine=0.999956
+- 2 code reviews (Opus), all CRITICAL/MAJOR issues fixed: FP16 denormal bug, Q8Linear safety, zero-copy forward
+- 29 Q8-related tests (19 unit + 8 integration + 2 real-weight quality)
+- 10 commits with incremental progress
+
+Quality: significantly exceeds plan expectations (0.9999+ cosine vs required 0.995)
+
+Next:
+- Generate Q8 Python reference data for Qwen3-Omni-30B (run omni_reference.py --quantize q8)
+- End-to-end inference test (requires Omni config parser update for nested configs)
+- Future: SIMD (Phase 7), GPU Q8 (Phase 6), Q4_0 (Phase 8)
