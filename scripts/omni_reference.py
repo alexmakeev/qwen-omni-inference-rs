@@ -12,6 +12,7 @@ Usage:
     python scripts/omni_reference.py --mode asr_test
     python scripts/omni_reference.py --mode tts_test
     python scripts/omni_reference.py --mode audio_to_audio
+    python scripts/omni_reference.py --mode image_test
     python scripts/omni_reference.py --mode full_reference
     python scripts/omni_reference.py --mode server [--server-port 8899]
 
@@ -30,7 +31,9 @@ import http.server
 import json
 import logging
 import os
+import random
 import re
+import shutil
 import sys
 import threading
 import time
@@ -150,6 +153,17 @@ def log_ram():
         pass
 
 
+def check_disk_free_gb(path="/", min_free_gb=30.0):
+    """Check disk free space. Raises RuntimeError if below minimum."""
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"Disk space critically low: {free_gb:.1f}GB free (minimum {min_free_gb}GB)"
+        )
+    return free_gb
+
+
 def save_npy(save_dir: Path, name: str, tensor: np.ndarray):
     """Save a numpy array as .npy file, logging shape and size."""
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +214,365 @@ class ActivationCapture:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+
+class PrefillActivationCapture:
+    """Capture ONLY the first (prefill) forward pass activations during generate().
+
+    During model.generate(), the forward pass runs once for the full input
+    sequence (prefill, seq_len > 1) and then once per generated token
+    (autoregressive, seq_len = 1). We want only the prefill activations
+    because those process the complete input and are what we validate
+    against in the Rust implementation.
+
+    Each registered name is captured exactly once (the first call).
+    Subsequent calls for the same name are ignored.
+    """
+
+    def __init__(self):
+        self.activations: Dict[str, np.ndarray] = {}
+        self._hooks: List[torch.utils.hooks.RemovableHook] = []
+
+    def register(self, name: str, module: torch.nn.Module):
+        def hook_fn(mod, inp, output):
+            # Only capture the first forward pass (prefill) for each name.
+            if name in self.activations:
+                return
+            if isinstance(output, tuple):
+                out = output[0]
+            elif isinstance(output, torch.Tensor):
+                out = output
+            elif hasattr(output, "last_hidden_state"):
+                # Model output objects (e.g. BaseModelOutputWithPooling) returned
+                # when hooking a whole tower module — extract the hidden states tensor.
+                out = output.last_hidden_state
+            else:
+                out = output
+            self.activations[name] = to_f32_numpy(out)
+
+        self._hooks.append(module.register_forward_hook(hook_fn))
+
+    def clear(self):
+        self.activations.clear()
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
+# ---------------------------------------------------------------------------
+# Thinker hook helpers for generate()-based modes (ASR, TTS, audio_to_audio)
+# ---------------------------------------------------------------------------
+
+def _register_thinker_hooks(model) -> PrefillActivationCapture:
+    """Register forward hooks on thinker layers for a full Omni model.
+
+    Navigates the model hierarchy to find:
+      - embed_tokens (embedding layer)
+      - layers[0..N-1] (transformer blocks)
+      - norm (final RMS norm)
+
+    For the full Qwen3OmniMoeForConditionalGeneration model, the thinker
+    lives at model.thinker, and its inner model at model.thinker.model.
+    For the thinker-only model, it may be at model.model.
+
+    Returns a PrefillActivationCapture with hooks registered. Caller must
+    call capture.remove_hooks() after generate() completes.
+    """
+    capture = PrefillActivationCapture()
+
+    # Navigate to the inner thinker model that contains embed_tokens, layers, norm.
+    # For full model: model -> model.thinker -> model.thinker.model
+    # For thinker-only: model -> model.model
+    thinker_inner = _find_attr(model, [
+        "thinker.model",       # Full Qwen3OmniMoe model
+        "model.model",         # Thinker-only model (Qwen3OmniMoeThinker.model)
+        "model",               # Flat model
+    ])
+    if thinker_inner is None:
+        logger.warning("Could not navigate to thinker inner model for hooks")
+        return capture
+
+    # Embedding
+    embed = _find_attr(thinker_inner, ["embed_tokens"])
+    if embed is not None:
+        capture.register("embedding_output", embed)
+        logger.info("Registered hook on embed_tokens")
+    else:
+        logger.warning("Could not locate embed_tokens for hooks")
+
+    # Transformer blocks
+    layers = _find_attr(thinker_inner, ["layers"])
+    if layers is not None and hasattr(layers, "__len__"):
+        for i, layer in enumerate(layers):
+            capture.register(f"thinker_layer_{i:02d}_output", layer)
+        logger.info("Registered hooks on %d thinker transformer layers", len(layers))
+    else:
+        logger.warning("Could not locate thinker transformer layers for hooks")
+
+    # Final norm
+    norm = _find_attr(thinker_inner, ["norm"])
+    if norm is not None:
+        capture.register("final_norm_output", norm)
+        logger.info("Registered hook on final norm")
+    else:
+        logger.warning("Could not locate final norm for hooks")
+
+    return capture
+
+
+def _save_thinker_activations(capture: PrefillActivationCapture, save_dir: Path):
+    """Save captured thinker layer activations as .npy files.
+
+    Expected keys in capture.activations:
+      - embedding_output
+      - thinker_layer_00_output .. thinker_layer_NN_output
+      - final_norm_output
+
+    Logs a summary of what was saved. Skips silently if no activations
+    were captured (e.g. model structure was not as expected).
+    """
+    if not capture.activations:
+        logger.warning("No thinker activations were captured by hooks")
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    n_saved = 0
+    for name, arr in sorted(capture.activations.items()):
+        save_npy(save_dir, name, arr)
+        n_saved += 1
+
+    logger.info(
+        "Saved %d thinker activation tensors (prefill pass) to %s",
+        n_saved, save_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audio tower hook helper
+# ---------------------------------------------------------------------------
+
+def _register_audio_tower_hooks(model) -> PrefillActivationCapture:
+    """Register forward hooks on audio tower layers.
+
+    Hooks on:
+      - model.thinker.audio_tower (whole tower output)
+      - model.thinker.audio_tower.layers[0..31] (32 transformer blocks)
+      - model.thinker.audio_tower.ln_post (final layer norm)
+
+    The audio tower only runs during prefill (processes audio features once),
+    so PrefillActivationCapture is used to capture only the first forward call.
+
+    Returns a PrefillActivationCapture with hooks registered. Caller must
+    call capture.remove_hooks() after generate() completes.
+    """
+    capture = PrefillActivationCapture()
+
+    audio_tower = _find_attr(model, [
+        "thinker.audio_tower",
+        "audio_tower",
+        "model.audio_tower",
+    ])
+    if audio_tower is None:
+        logger.warning("Could not locate audio_tower for hooks")
+        return capture
+
+    # Whole audio tower output
+    capture.register("audio_tower_output", audio_tower)
+    logger.info("Registered hook on audio_tower (whole)")
+
+    # Individual transformer layers
+    layers = _find_attr(audio_tower, ["layers"])
+    if layers is not None and hasattr(layers, "__len__"):
+        for i, layer in enumerate(layers):
+            capture.register(f"audio_layer_{i:02d}_output", layer)
+        logger.info("Registered hooks on %d audio tower layers", len(layers))
+    else:
+        logger.warning("Could not locate audio_tower.layers for hooks")
+
+    # Final layer norm (ln_post)
+    ln_post = _find_attr(audio_tower, ["ln_post"])
+    if ln_post is not None:
+        capture.register("audio_ln_post_output", ln_post)
+        logger.info("Registered hook on audio_tower.ln_post")
+    else:
+        logger.warning("Could not locate audio_tower.ln_post for hooks")
+
+    return capture
+
+
+def _save_audio_tower_activations(capture: PrefillActivationCapture, save_dir: Path):
+    """Save captured audio tower activations as .npy files.
+
+    Expected keys in capture.activations:
+      - audio_tower_output
+      - audio_layer_00_output .. audio_layer_31_output
+      - audio_ln_post_output
+    """
+    if not capture.activations:
+        logger.warning("No audio tower activations were captured by hooks")
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    n_saved = 0
+    for name, arr in sorted(capture.activations.items()):
+        save_npy(save_dir, name, arr)
+        n_saved += 1
+
+    logger.info(
+        "Saved %d audio tower activation tensors (prefill pass) to %s",
+        n_saved, save_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Talker hook helper
+# ---------------------------------------------------------------------------
+
+def _register_talker_hooks(model) -> PrefillActivationCapture:
+    """Register forward hooks on talker (TTS decoder) layers.
+
+    Hooks on:
+      - model.talker.model.layers[0..19] (20 transformer blocks)
+      - model.talker.model.norm (final RMS norm)
+
+    PrefillActivationCapture is used to capture only the first codec token
+    generation step activations.
+
+    Returns a PrefillActivationCapture with hooks registered. Caller must
+    call capture.remove_hooks() after generate() completes.
+    """
+    capture = PrefillActivationCapture()
+
+    talker_inner = _find_attr(model, [
+        "talker.model",
+        "model.talker.model",
+    ])
+    if talker_inner is None:
+        logger.warning("Could not locate talker.model for hooks")
+        return capture
+
+    # Transformer blocks
+    layers = _find_attr(talker_inner, ["layers"])
+    if layers is not None and hasattr(layers, "__len__"):
+        for i, layer in enumerate(layers):
+            capture.register(f"talker_layer_{i:02d}_output", layer)
+        logger.info("Registered hooks on %d talker transformer layers", len(layers))
+    else:
+        logger.warning("Could not locate talker.model.layers for hooks")
+
+    # Final norm
+    norm = _find_attr(talker_inner, ["norm"])
+    if norm is not None:
+        capture.register("talker_norm_output", norm)
+        logger.info("Registered hook on talker.model.norm")
+    else:
+        logger.warning("Could not locate talker.model.norm for hooks")
+
+    return capture
+
+
+def _save_talker_activations(capture: PrefillActivationCapture, save_dir: Path):
+    """Save captured talker layer activations as .npy files.
+
+    Expected keys in capture.activations:
+      - talker_layer_00_output .. talker_layer_19_output
+      - talker_norm_output
+    """
+    if not capture.activations:
+        logger.warning("No talker activations were captured by hooks")
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    n_saved = 0
+    for name, arr in sorted(capture.activations.items()):
+        save_npy(save_dir, name, arr)
+        n_saved += 1
+
+    logger.info(
+        "Saved %d talker activation tensors to %s",
+        n_saved, save_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vision tower hook helper
+# ---------------------------------------------------------------------------
+
+def _register_vision_tower_hooks(model) -> PrefillActivationCapture:
+    """Register forward hooks on vision tower layers.
+
+    Hooks on:
+      - model.thinker.visual (whole vision tower output)
+      - model.thinker.visual.blocks[0..26] (27 ViT blocks)
+      - model.thinker.visual.merger (patch merger / projection)
+
+    IMPORTANT: The attribute is 'visual', NOT 'vision_tower'.
+
+    PrefillActivationCapture is used since the vision tower only runs
+    during prefill (processes image features once per request).
+
+    Returns a PrefillActivationCapture with hooks registered. Caller must
+    call capture.remove_hooks() after generate() completes.
+    """
+    capture = PrefillActivationCapture()
+
+    visual = _find_attr(model, [
+        "thinker.visual",
+        "visual",
+        "model.visual",
+    ])
+    if visual is None:
+        logger.warning("Could not locate thinker.visual for hooks")
+        return capture
+
+    # Whole vision tower output
+    capture.register("vision_tower_output", visual)
+    logger.info("Registered hook on thinker.visual (whole)")
+
+    # Individual ViT blocks
+    blocks = _find_attr(visual, ["blocks"])
+    if blocks is not None and hasattr(blocks, "__len__"):
+        for i, block in enumerate(blocks):
+            capture.register(f"vision_block_{i:02d}_output", block)
+        logger.info("Registered hooks on %d vision tower blocks", len(blocks))
+    else:
+        logger.warning("Could not locate thinker.visual.blocks for hooks")
+
+    # Patch merger / projection
+    merger = _find_attr(visual, ["merger"])
+    if merger is not None:
+        capture.register("vision_merger_output", merger)
+        logger.info("Registered hook on thinker.visual.merger")
+    else:
+        logger.warning("Could not locate thinker.visual.merger for hooks")
+
+    return capture
+
+
+def _save_vision_tower_activations(capture: PrefillActivationCapture, save_dir: Path):
+    """Save captured vision tower activations as .npy files.
+
+    Expected keys in capture.activations:
+      - vision_tower_output
+      - vision_block_00_output .. vision_block_26_output
+      - vision_merger_output
+    """
+    if not capture.activations:
+        logger.warning("No vision tower activations were captured by hooks")
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    n_saved = 0
+    for name, arr in sorted(capture.activations.items()):
+        save_npy(save_dir, name, arr)
+        n_saved += 1
+
+    logger.info(
+        "Saved %d vision tower activation tensors (prefill pass) to %s",
+        n_saved, save_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +715,9 @@ def run_text_test(
     logger.info("MODE: text_test")
     logger.info("=" * 70)
 
+    free_gb = check_disk_free_gb()
+    logger.info("Disk free: %.1f GB", free_gb)
+
     save_dir = output_base / "omni_text_test"
     max_new_tokens = 10
 
@@ -453,6 +829,7 @@ def run_text_test(
     logger.info("Generated text (new tokens only): %r", generated_text)
 
     save_text(save_dir, "generated_text.txt", generated_text)
+    check_disk_free_gb()
     log_ram()
     logger.info("text_test complete. Output: %s", save_dir)
 
@@ -476,11 +853,18 @@ def run_asr_test(
     family: model family string ('qwen3_omni_moe' or 'qwen2_5_omni').
             Auto-detected from model_path if not provided.
 
-    Saves: generated_text.txt
+    Saves:
+        generated_text.txt
+        embedding_output.npy           (thinker prefill)
+        thinker_layer_00_output.npy .. thinker_layer_47_output.npy
+        final_norm_output.npy
     """
     logger.info("=" * 70)
     logger.info("MODE: asr_test")
     logger.info("=" * 70)
+
+    free_gb = check_disk_free_gb()
+    logger.info("Disk free: %.1f GB", free_gb)
 
     save_dir = output_base / "omni_asr_test"
     max_new_tokens = 562  # 512 thinking + 50 answer budget
@@ -613,6 +997,13 @@ def run_asr_test(
     audio_pad_count = (inputs["input_ids"] == audio_pad_id).sum().item()
     logger.info("DEBUG: audio_pad tokens in input_ids: %d", audio_pad_count)
 
+    # Register thinker layer hooks to capture prefill activations during generate().
+    # This captures the same layers as text_test: embedding, all thinker layers, final norm.
+    thinker_capture = _register_thinker_hooks(model)
+
+    # Register audio tower hooks to capture audio encoder activations during prefill.
+    audio_capture = _register_audio_tower_hooks(model)
+
     # Use model.generate() for Qwen3-Omni.
     # The audio tower is part of the thinker (Qwen3OmniMoeThinkerForConditionalGeneration
     # contains self.audio_tower), so both model.generate() and model.thinker.generate()
@@ -702,6 +1093,18 @@ def run_asr_test(
     logger.info("Transcription: %r", transcribed)
 
     save_text(save_dir, "generated_text.txt", transcribed)
+
+    # Save thinker layer activations captured during generate() prefill pass.
+    _save_thinker_activations(thinker_capture, save_dir)
+    thinker_capture.remove_hooks()
+    thinker_capture.clear()
+
+    # Save audio tower activations captured during generate() prefill pass.
+    _save_audio_tower_activations(audio_capture, save_dir)
+    audio_capture.remove_hooks()
+    audio_capture.clear()
+
+    check_disk_free_gb()
     log_ram()
     logger.info("asr_test complete. Output: %s", save_dir)
 
@@ -724,11 +1127,19 @@ def run_tts_test(
     Note: server mode loads a single full model; TTS requires enable_audio_output=True
     which may not match the server-loaded model. A warning is logged in that case.
 
-    Saves: output.wav
+    Saves:
+        output.wav
+        generated_text.txt
+        embedding_output.npy           (thinker prefill)
+        thinker_layer_00_output.npy .. thinker_layer_47_output.npy
+        final_norm_output.npy
     """
     logger.info("=" * 70)
     logger.info("MODE: tts_test")
     logger.info("=" * 70)
+
+    free_gb = check_disk_free_gb()
+    logger.info("Disk free: %.1f GB", free_gb)
 
     save_dir = output_base / "omni_tts_test"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -766,6 +1177,12 @@ def run_tts_test(
     for key in inputs:
         if isinstance(inputs[key], torch.Tensor) and inputs[key].dtype == torch.float32:
             inputs[key] = inputs[key].to(torch.bfloat16)
+
+    # Register thinker layer hooks to capture prefill activations during generate().
+    thinker_capture = _register_thinker_hooks(model)
+
+    # Register talker hooks to capture codec token generation activations.
+    talker_capture = _register_talker_hooks(model)
 
     logger.info("Generating TTS for: %r", text_to_speak)
     log_ram()
@@ -826,6 +1243,17 @@ def run_tts_test(
     else:
         logger.warning("No audio waveform produced — check model has_talker status")
 
+    # Save thinker layer activations captured during generate() prefill pass.
+    _save_thinker_activations(thinker_capture, save_dir)
+    thinker_capture.remove_hooks()
+    thinker_capture.clear()
+
+    # Save talker layer activations captured during codec token generation.
+    _save_talker_activations(talker_capture, save_dir)
+    talker_capture.remove_hooks()
+    talker_capture.clear()
+
+    check_disk_free_gb()
     log_ram()
     logger.info("tts_test complete. Output: %s", save_dir)
 
@@ -854,10 +1282,16 @@ def run_audio_to_audio_test(
     Saves:
         generated_text.txt   — text content of the model's response
         output.wav           — spoken audio response at 24000 Hz
+        embedding_output.npy           (thinker prefill)
+        thinker_layer_00_output.npy .. thinker_layer_47_output.npy
+        final_norm_output.npy
     """
     logger.info("=" * 70)
     logger.info("MODE: audio_to_audio")
     logger.info("=" * 70)
+
+    free_gb = check_disk_free_gb()
+    logger.info("Disk free: %.1f GB", free_gb)
 
     save_dir = output_base / "omni_audio_to_audio"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -936,6 +1370,15 @@ def run_audio_to_audio_test(
     )
     log_ram()
 
+    # Register thinker layer hooks to capture prefill activations during generate().
+    thinker_capture = _register_thinker_hooks(model)
+
+    # Register audio tower hooks to capture audio encoder activations during prefill.
+    audio_capture = _register_audio_tower_hooks(model)
+
+    # Register talker hooks to capture codec token generation activations.
+    talker_capture = _register_talker_hooks(model)
+
     # Check if model supports audio output
     has_talker = hasattr(model, "talker") or getattr(model, "has_talker", False)
 
@@ -987,8 +1430,229 @@ def run_audio_to_audio_test(
     else:
         logger.warning("No audio output produced — model may not have talker enabled")
 
+    # Save thinker layer activations captured during generate() prefill pass.
+    _save_thinker_activations(thinker_capture, save_dir)
+    thinker_capture.remove_hooks()
+    thinker_capture.clear()
+
+    # Save audio tower activations captured during generate() prefill pass.
+    _save_audio_tower_activations(audio_capture, save_dir)
+    audio_capture.remove_hooks()
+    audio_capture.clear()
+
+    # Save talker layer activations captured during codec token generation.
+    _save_talker_activations(talker_capture, save_dir)
+    talker_capture.remove_hooks()
+    talker_capture.clear()
+
+    check_disk_free_gb()
     log_ram()
     logger.info("audio_to_audio complete. Output: %s", save_dir)
+
+
+# ---------------------------------------------------------------------------
+# Mode: image_test
+# ---------------------------------------------------------------------------
+
+def run_image_test(
+    model_path: str,
+    output_base: Path,
+    model=None,
+    processor=None,
+    family: Optional[str] = None,
+):
+    """
+    Generate a synthetic 224x224 RGB image, run vision-language inference,
+    and save vision tower + thinker activations.
+
+    Creates a gradient test image programmatically (no file dependency).
+    If model and processor are provided, skips loading (server mode).
+    family: model family string ('qwen3_omni_moe' or 'qwen2_5_omni').
+            Auto-detected from model_path if not provided.
+
+    Saves:
+        test_image.png                     (synthetic 224x224 gradient input)
+        generated_text.txt
+        vision_tower_output.npy            (whole visual tower output)
+        vision_block_00..26_output.npy     (27 ViT block outputs)
+        vision_merger_output.npy           (patch merger/projection output)
+        embedding_output.npy               (thinker prefill)
+        thinker_layer_00..47_output.npy
+        final_norm_output.npy
+    """
+    logger.info("=" * 70)
+    logger.info("MODE: image_test")
+    logger.info("=" * 70)
+
+    free_gb = check_disk_free_gb()
+    logger.info("Disk free: %.1f GB", free_gb)
+
+    save_dir = output_base / "omni_image_test"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    max_new_tokens = 64
+
+    if family is None:
+        family = detect_model_family(model_path)
+    logger.info("Model family: %s", family)
+
+    if model is None or processor is None:
+        model, processor = load_full_model(model_path, enable_audio_output=False)
+
+    # Create a synthetic 224x224 RGB gradient image programmatically.
+    # This avoids any file dependency and produces a deterministic, reproducible input.
+    try:
+        from PIL import Image as PILImage
+        import numpy as _np_img
+        # Horizontal gradient: red channel 0->255 left to right
+        # Vertical gradient: green channel 0->255 top to bottom
+        # Blue channel: constant mid-value
+        width, height = 224, 224
+        r = _np_img.tile(
+            _np_img.linspace(0, 255, width, dtype=_np_img.uint8), (height, 1)
+        )
+        g = _np_img.tile(
+            _np_img.linspace(0, 255, height, dtype=_np_img.uint8).reshape(-1, 1), (1, width)
+        )
+        b = _np_img.full((height, width), 128, dtype=_np_img.uint8)
+        rgb = _np_img.stack([r, g, b], axis=2)
+        pil_image = PILImage.fromarray(rgb, mode="RGB")
+    except ImportError:
+        logger.error("PIL (Pillow) not available. Install with: pip install Pillow")
+        return
+
+    # Save the synthetic input image for reference
+    image_path = save_dir / "test_image.png"
+    pil_image.save(str(image_path))
+    logger.info("Saved synthetic test image: %s", image_path)
+
+    # Build conversation with image content using the Qwen3-Omni message format.
+    # We pass the PIL Image object directly; process_mm_info handles it.
+    conversations = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "You are a helpful assistant."}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_image},
+                {"type": "text", "text": "Describe what you see in the image."},
+            ],
+        },
+    ]
+
+    logger.info("Applying chat template ...")
+    template_kwargs = dict(add_generation_prompt=True, tokenize=False)
+    if family == "qwen3_omni_moe":
+        template_kwargs["enable_thinking"] = False
+    text = processor.apply_chat_template(conversations, **template_kwargs)
+    logger.info("Chat template output (first 300 chars): %s", text[:300])
+
+    # Load image via process_mm_info (official API for multi-modal inputs).
+    try:
+        from qwen_omni_utils import process_mm_info
+        audios, images, videos = process_mm_info(conversations, use_audio_in_video=False)
+        logger.info(
+            "Images loaded via process_mm_info: %d image(s)",
+            len(images) if images else 0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "process_mm_info failed (%s) — passing PIL image directly to processor", exc
+        )
+        audios = None
+        images = [pil_image]
+        videos = None
+
+    logger.info("Processing inputs ...")
+    inputs = processor(
+        text=text,
+        audio=audios,
+        images=images,
+        videos=videos,
+        return_tensors="pt",
+        padding=True,
+    )
+    # Convert float32 tensors to bfloat16 to match model weights dtype.
+    for key in inputs:
+        if (
+            isinstance(inputs[key], torch.Tensor)
+            and inputs[key].is_floating_point()
+            and inputs[key].dtype != torch.bfloat16
+        ):
+            inputs[key] = inputs[key].to(torch.bfloat16)
+    logger.info(
+        "Input tensors: %s",
+        {k: (v.shape, v.dtype) for k, v in inputs.items() if hasattr(v, "shape")},
+    )
+    log_ram()
+
+    # Register thinker hooks (captures embedding, all thinker layers, final norm)
+    thinker_capture = _register_thinker_hooks(model)
+
+    # Register vision tower hooks (captures visual blocks, whole tower, merger)
+    vision_capture = _register_vision_tower_hooks(model)
+
+    logger.info("Generating via model.generate() (max_new_tokens: %d) ...", max_new_tokens)
+    t0 = time.time()
+    with torch.no_grad():
+        if family == "qwen3_omni_moe":
+            result = model.generate(
+                **inputs,
+                return_audio=False,
+                thinker_max_new_tokens=max_new_tokens,
+                thinker_do_sample=False,
+                thinker_pad_token_id=processor.tokenizer.eos_token_id,
+                thinker_eos_token_id=processor.tokenizer.eos_token_id,
+            )
+            if isinstance(result, tuple):
+                generated = result[0]
+                if hasattr(generated, "sequences"):
+                    generated = generated.sequences
+            elif hasattr(result, "sequences"):
+                generated = result.sequences
+            else:
+                generated = result
+        else:
+            result = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+            if isinstance(result, tuple):
+                generated = result[0]
+            else:
+                generated = result
+    elapsed = time.time() - t0
+
+    input_len = inputs["input_ids"].shape[1]
+    n_new = generated.shape[1] - input_len
+    logger.info(
+        "Generated %d tokens in %.1f s  (%.1f s/token)",
+        n_new, elapsed, elapsed / max(n_new, 1),
+    )
+
+    # Decode and save generated text
+    new_ids = generated[:, input_len:]
+    raw_decoded = processor.tokenizer.decode(new_ids[0], skip_special_tokens=True)
+    # Strip any thinking block if present
+    cleaned = re.sub(r'<think>.*?</think>', '', raw_decoded, flags=re.DOTALL).strip()
+    logger.info("Generated text: %r", cleaned[:200])
+    save_text(save_dir, "generated_text.txt", cleaned)
+
+    # Save thinker activations
+    _save_thinker_activations(thinker_capture, save_dir)
+    thinker_capture.remove_hooks()
+    thinker_capture.clear()
+
+    # Save vision tower activations
+    _save_vision_tower_activations(vision_capture, save_dir)
+    vision_capture.remove_hooks()
+    vision_capture.clear()
+
+    check_disk_free_gb()
+    log_ram()
+    logger.info("image_test complete. Output: %s", save_dir)
 
 
 def _save_wav(path: Path, audio: np.ndarray, sample_rate: int):
@@ -1748,7 +2412,7 @@ class _OmniRequestHandler(http.server.BaseHTTPRequestHandler):
         test_name = body.get("test")
         params = body.get("params", {})
 
-        valid_tests = ["text_test", "asr_test", "tts_test", "full_reference", "audio_to_audio"]
+        valid_tests = ["text_test", "asr_test", "tts_test", "full_reference", "audio_to_audio", "image_test"]
         if test_name not in valid_tests:
             self._send_json(400, {
                 "error": f"Unknown test {test_name!r}. Valid: {valid_tests}",
@@ -1766,6 +2430,14 @@ class _OmniRequestHandler(http.server.BaseHTTPRequestHandler):
         logger.info("Running test %r with pre-loaded model (family=%s) ...", test_name, family)
         if params.get("audio_file"):
             logger.info("Using audio_file from request params: %s", audio_file)
+
+        try:
+            free_gb = check_disk_free_gb()
+            logger.info("Disk free before test: %.1f GB", free_gb)
+        except RuntimeError as disk_err:
+            self._send_json(500, {"error": str(disk_err)})
+            return
+
         t0 = time.time()
         error = None
         output_dir = None
@@ -1821,6 +2493,17 @@ class _OmniRequestHandler(http.server.BaseHTTPRequestHandler):
                     model_path=model_path,
                     output_base=output_base,
                     audio_file=audio_file,
+                    model=model,
+                    processor=processor,
+                    family=family,
+                )
+                output_dir = str(save_dir)
+
+            elif test_name == "image_test":
+                save_dir = output_base / "omni_image_test"
+                run_image_test(
+                    model_path=model_path,
+                    output_base=output_base,
                     model=model,
                     processor=processor,
                     family=family,
@@ -1962,7 +2645,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["text_test", "asr_test", "tts_test", "full_reference", "audio_to_audio", "server"],
+        choices=["text_test", "asr_test", "tts_test", "full_reference", "audio_to_audio", "image_test", "server"],
         required=True,
         help="Which mode to run",
     )
@@ -1992,6 +2675,17 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    # === Deterministic execution for reproducibility ===
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print(f"[SEED] Deterministic mode enabled, seed={SEED}")
 
     model_path = args.model_path
     output_base = Path(args.output_dir)
@@ -2025,6 +2719,9 @@ def main():
 
         elif args.mode == "audio_to_audio":
             run_audio_to_audio_test(model_path, output_base, audio_file)
+
+        elif args.mode == "image_test":
+            run_image_test(model_path, output_base)
 
         elif args.mode == "server":
             run_server(
