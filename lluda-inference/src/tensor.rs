@@ -36,6 +36,7 @@
 
 use crate::bf16::BF16;
 use crate::error::{LludaError, Result};
+use crate::quant::{Q8Block, QuantBlock, quantize_f32_to_q8};
 
 #[cfg(feature = "gpu")]
 use std::sync::Arc;
@@ -49,6 +50,8 @@ pub enum DType {
     BF16,
     /// Float 32 (32-bit floating point, used for compute)
     F32,
+    /// 8-bit quantization, block size 32 (storage only, dequantize before compute)
+    Q8_0,
 }
 
 impl std::fmt::Display for DType {
@@ -56,6 +59,7 @@ impl std::fmt::Display for DType {
         match self {
             DType::BF16 => write!(f, "BF16"),
             DType::F32 => write!(f, "F32"),
+            DType::Q8_0 => write!(f, "Q8_0"),
         }
     }
 }
@@ -69,6 +73,12 @@ enum TensorData {
     BF16(Vec<BF16>),
     /// F32 storage (for activations and compute results)
     F32(Vec<f32>),
+    /// Q8_0 quantized storage (block-quantized weights, dequantize before compute)
+    Q8_0 {
+        blocks: Vec<Q8Block>,
+        /// Original number of elements (before padding to block boundary)
+        numel: usize,
+    },
     /// GPU buffer storage (when gpu feature is enabled)
     #[cfg(feature = "gpu")]
     GpuBuffer {
@@ -83,6 +93,7 @@ impl TensorData {
         match self {
             TensorData::BF16(_) => DType::BF16,
             TensorData::F32(_) => DType::F32,
+            TensorData::Q8_0 { .. } => DType::Q8_0,
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { dtype, .. } => *dtype,
         }
@@ -186,6 +197,46 @@ impl Tensor {
         })
     }
 
+    /// Create a Q8_0 tensor from pre-quantized blocks.
+    ///
+    /// The shape dimensions must multiply to `numel`, and `blocks.len()` must
+    /// equal `ceil(numel / 32)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `blocks` - Q8_0 quantized blocks (34 bytes each)
+    /// * `numel` - Original element count (before block-boundary padding)
+    /// * `shape` - Tensor shape (product must equal numel)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if shape product != numel, or if blocks.len() != ceil(numel / 32).
+    pub fn from_q8_blocks(blocks: Vec<Q8Block>, numel: usize, shape: Vec<usize>) -> Result<Self> {
+        let shape_numel: usize = shape.iter().product();
+        if shape_numel != numel {
+            return Err(LludaError::ShapeMismatch {
+                expected: vec![numel],
+                got: vec![shape_numel],
+            });
+        }
+
+        let expected_blocks = (numel + 31) / 32;
+        if blocks.len() != expected_blocks {
+            return Err(LludaError::Msg(format!(
+                "from_q8_blocks: expected {} blocks for {} elements (ceil({}/32)), got {}",
+                expected_blocks, numel, numel, blocks.len()
+            )));
+        }
+
+        let strides = compute_strides(&shape);
+
+        Ok(Tensor {
+            data: TensorData::Q8_0 { blocks, numel },
+            shape,
+            strides,
+        })
+    }
+
     /// Convert tensor to a different data type.
     ///
     /// Creates a new tensor with data converted to the target dtype.
@@ -220,6 +271,40 @@ impl Tensor {
                 // BF16 -> F32
                 let f32_vec = BF16::to_f32_slice(bf16_vec);
                 TensorData::F32(f32_vec)
+            }
+            (TensorData::F32(f32_vec), DType::Q8_0) => {
+                // F32 -> Q8_0: quantize
+                let numel = f32_vec.len();
+                let blocks = quantize_f32_to_q8(f32_vec);
+                TensorData::Q8_0 { blocks, numel }
+            }
+            (TensorData::BF16(bf16_vec), DType::Q8_0) => {
+                // BF16 -> Q8_0: convert to F32 first, then quantize
+                let f32_vec = BF16::to_f32_slice(bf16_vec);
+                let numel = f32_vec.len();
+                let blocks = quantize_f32_to_q8(&f32_vec);
+                TensorData::Q8_0 { blocks, numel }
+            }
+            (TensorData::Q8_0 { blocks, numel }, DType::F32) => {
+                // Q8_0 -> F32: dequantize
+                let mut result = Vec::with_capacity(*numel);
+                for block in blocks {
+                    let vals = block.dequantize();
+                    result.extend_from_slice(&vals);
+                }
+                result.truncate(*numel);
+                TensorData::F32(result)
+            }
+            (TensorData::Q8_0 { blocks, numel }, DType::BF16) => {
+                // Q8_0 -> BF16: dequantize to F32, then convert to BF16
+                let mut f32_result = Vec::with_capacity(*numel);
+                for block in blocks {
+                    let vals = block.dequantize();
+                    f32_result.extend_from_slice(&vals);
+                }
+                f32_result.truncate(*numel);
+                let bf16_vec: Vec<BF16> = f32_result.iter().map(|&x| BF16::from(x)).collect();
+                TensorData::BF16(bf16_vec)
             }
             _ => unreachable!("Already checked for same dtype above"),
         };
@@ -313,6 +398,15 @@ impl Tensor {
         match &self.data {
             TensorData::F32(v) => v.clone(),
             TensorData::BF16(v) => BF16::to_f32_slice(v),
+            TensorData::Q8_0 { blocks, numel } => {
+                let mut result = Vec::with_capacity(*numel);
+                for block in blocks {
+                    let vals = block.dequantize();
+                    result.extend_from_slice(&vals);
+                }
+                result.truncate(*numel);
+                result
+            }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
                 panic!("Cannot extract F32 data from GPU buffer. Use to_cpu() first.")
@@ -343,6 +437,9 @@ impl Tensor {
         match &self.data {
             TensorData::BF16(v) => v.clone(),
             TensorData::F32(v) => v.iter().map(|&f| BF16::from(f)).collect(),
+            TensorData::Q8_0 { .. } => {
+                panic!("Cannot extract BF16 data from Q8_0 tensor. Use to_vec_f32() or to_dtype(DType::BF16) first.")
+            }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
                 panic!("Cannot extract BF16 data from GPU buffer. Use to_cpu() first.")
@@ -396,6 +493,11 @@ impl Tensor {
         match &self.data {
             TensorData::F32(data) => Tensor::new(data.clone(), new_shape.to_vec()),
             TensorData::BF16(data) => Tensor::from_bf16(data.clone(), new_shape.to_vec()),
+            TensorData::Q8_0 { .. } => {
+                Err(LludaError::Msg(
+                    "reshape not supported for Q8_0 tensors — reshape the dequantized F32 tensor instead".to_string(),
+                ))
+            }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
                 Err(LludaError::Msg(
@@ -476,6 +578,11 @@ impl Tensor {
                 }
 
                 Tensor::new(result, vec![n, m])
+            }
+            TensorData::Q8_0 { .. } => {
+                Err(LludaError::Msg(
+                    "transpose not supported for Q8_0 tensors — dequantize to F32 first".to_string(),
+                ))
             }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
@@ -637,6 +744,11 @@ impl Tensor {
 
                 let transposed = Tensor::new(result, new_shape)?;
                 transposed.to_dtype(original_dtype)
+            }
+            TensorData::Q8_0 { .. } => {
+                Err(LludaError::Msg(
+                    "transpose not supported for Q8_0 tensors — dequantize to F32 first".to_string(),
+                ))
             }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
@@ -802,6 +914,14 @@ impl Tensor {
     /// assert_eq!(c.shape(), &[2, 2]);
     /// ```
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
+        // Q8_0 matmul is not supported via this path.
+        // Use quant::matmul_f32_x_quant directly through the Linear struct.
+        if self.dtype() == DType::Q8_0 || rhs.dtype() == DType::Q8_0 {
+            return Err(LludaError::Msg(
+                "Q8_0 matmul not supported via Tensor::matmul — use quant::matmul_f32_x_quant directly".to_string(),
+            ));
+        }
+
         // GPU MODE: Strict GPU-or-fail policy (see GPU_DESIGN_PRINCIPLES.md)
         // No fallbacks - operations must use GPU or return error
         #[cfg(feature = "gpu")]
@@ -1980,6 +2100,11 @@ impl Tensor {
                     .collect();
                 Tensor::new(result, self.shape.clone())
             }
+            TensorData::Q8_0 { .. } => {
+                Err(LludaError::Msg(
+                    "silu not supported for Q8_0 tensors — dequantize to F32 first".into()
+                ))
+            }
             #[cfg(feature = "gpu")]
             TensorData::GpuBuffer { .. } => {
                 Err(LludaError::Msg(
@@ -2416,6 +2541,11 @@ impl Tensor {
             DType::F32 => Tensor::new(vec![0.0f32; numel], shape.to_vec()),
             DType::BF16 => {
                 Tensor::from_bf16(vec![BF16::from(0.0f32); numel], shape.to_vec())
+            }
+            DType::Q8_0 => {
+                Err(LludaError::Msg(
+                    "zeros not supported for Q8_0 dtype — create F32 zeros and convert with to_dtype(DType::Q8_0)".to_string(),
+                ))
             }
         }
     }
@@ -2969,6 +3099,11 @@ impl Tensor {
                     dtype: DType::F32,
                 }
             }
+            TensorData::Q8_0 { .. } => {
+                return Err(LludaError::Msg(
+                    "Cannot upload Q8_0 tensor to GPU — dequantize to F32 or BF16 first".to_string(),
+                ));
+            }
             TensorData::GpuBuffer { .. } => {
                 return Err(LludaError::Msg("Tensor is already on GPU".to_string()));
             }
@@ -3012,6 +3147,11 @@ impl Tensor {
                 let size = match dtype {
                     DType::BF16 => num_elements * 2,
                     DType::F32 => num_elements * 4,
+                    DType::Q8_0 => {
+                        return Err(LludaError::Msg(
+                            "Q8_0 tensors cannot be on GPU".to_string(),
+                        ));
+                    }
                 };
 
                 // Reconstruct GpuTensorBuffer from Arc<Buffer>
@@ -3029,6 +3169,11 @@ impl Tensor {
                     DType::F32 => {
                         let f32_data = gpu_buffer.to_cpu_f32(ctx)?;
                         TensorData::F32(f32_data)
+                    }
+                    DType::Q8_0 => {
+                        return Err(LludaError::Msg(
+                            "Q8_0 tensors cannot be on GPU".to_string(),
+                        ));
                     }
                 };
 

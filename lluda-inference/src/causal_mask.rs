@@ -158,6 +158,11 @@ pub fn causal_mask(
                 .collect();
             Tensor::from_bf16(bf16_data, vec![batch_size, 1, seq_len, total_len])?
         }
+        DType::Q8_0 => {
+            return Err(crate::error::LludaError::Msg(
+                "causal_mask does not support Q8_0 dtype — use F32 or BF16".to_string(),
+            ));
+        }
     };
 
     Ok(Some(mask))

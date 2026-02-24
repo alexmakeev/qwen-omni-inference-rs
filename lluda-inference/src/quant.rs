@@ -81,7 +81,7 @@ pub trait QuantBlock: Sized + Send + Sync + 'static {
 /// quants[i] = round(values[i] / scale), clamped to [-128, 127]
 /// ```
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Q8Block {
     /// FP16 scale factor (IEEE 754 half-precision, NOT BF16).
     pub scale_bits: u16,
