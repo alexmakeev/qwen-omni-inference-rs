@@ -168,7 +168,7 @@ impl Q8Linear {
                         in_features)
             ));
         }
-        let blocks_per_row = (in_features + 31) / 32;
+        let blocks_per_row = in_features / 32;
         let expected_blocks = out_features * blocks_per_row;
         if blocks.len() != expected_blocks {
             return Err(crate::error::LludaError::ShapeMismatch {

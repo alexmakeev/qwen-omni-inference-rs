@@ -301,14 +301,12 @@ impl Qwen3ForCausalLM {
         })
     }
 
-    /// Load Qwen3ForCausalLM with Q8_0 quantized linear layers.
+    /// Load model with Q8_0 quantized weights.
     ///
-    /// Equivalent to `load()` but loads weights via `ModelWeights::from_safetensors_q8`,
-    /// so all 2D weight tensors (attention projections, MLP projections) are quantized
-    /// to Q8_0. Embeddings and norm weights stay in their original dtype.
-    ///
-    /// The underlying `load_decoder_layer` automatically detects Q8_0 tensors via
-    /// `make_linear()` and wraps them in `AnyLinear::Q8`.
+    /// Functionally identical to `load()` — `make_linear()` auto-detects Q8_0
+    /// tensors and dispatches to `Q8Linear`. This method exists to document that
+    /// `weights` should come from `ModelWeights::from_safetensors_q8()` or
+    /// `ModelWeights::from_safetensors_dir_q8()`.
     ///
     /// # Arguments
     ///

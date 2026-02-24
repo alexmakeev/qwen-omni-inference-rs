@@ -58,10 +58,9 @@ pub trait QuantBlock: Sized + Send + Sync + 'static {
     /// No intermediate f32 weight array is materialized — fused into a single loop.
     fn block_dot_f32(&self, activations: &[f32; 32]) -> f32;
 
-    /// Dequantize to f32.
-    ///
-    /// **ONLY for testing and debugging, NOT for inference.**
-    /// Inference uses `block_dot_f32` to avoid materializing full f32 weight tensors.
+    /// Dequantize block to f32 values.
+    /// Used for dtype conversion (Q8→F32) and testing.
+    /// Inference should use `block_dot_f32` for fused computation.
     fn dequantize(&self) -> [f32; 32];
 }
 
@@ -298,9 +297,9 @@ impl QuantBlock for Q8Block {
         acc * self.scale()
     }
 
-    /// Dequantize all 32 values to f32.
-    ///
-    /// **For testing only.** During inference, use `block_dot_f32` instead.
+    /// Dequantize block to f32 values.
+    /// Used for dtype conversion (Q8→F32) and testing.
+    /// Inference should use `block_dot_f32` for fused computation.
     fn dequantize(&self) -> [f32; 32] {
         let s = self.scale();
         let mut out = [0.0f32; 32];

@@ -46,6 +46,16 @@ pub struct ModelWeights {
     mmap: Arc<Mmap>, // Keep mmap alive for the lifetime of weights
 }
 
+/// Returns true if a tensor should be quantized to Q8_0.
+/// Quantized: 2D weight tensors (linear projections).
+/// NOT quantized: embeddings (lookup tables), norms (1D), biases (1D).
+fn is_quantizable_weight(name: &str, shape: &[usize]) -> bool {
+    shape.len() == 2
+        && name.contains("weight")
+        && !name.contains("embed_tokens")
+        && !name.contains("norm")
+}
+
 impl ModelWeights {
     /// Load model weights from a SafeTensors file.
     ///
@@ -149,15 +159,7 @@ impl ModelWeights {
         for (name, view) in tensors.tensors() {
             let shape = view.shape().to_vec();
 
-            // Quantize 2D weight tensors to Q8_0, excluding embeddings and norms.
-            // Embeddings are lookup tables — quantizing them would require dequant
-            // on every token lookup. Norms are 1D and tiny; no gain from quantizing.
-            let is_2d_linear_weight = shape.len() == 2
-                && name.contains("weight")
-                && !name.contains("embed_tokens")
-                && !name.contains("norm");
-
-            if is_2d_linear_weight {
+            if is_quantizable_weight(&name, &shape) {
                 // Load BF16/F32 tensor then convert to f32 for quantization
                 let tensor = load_tensor(&view)?;
                 let f32_data = tensor.to_vec_f32();
@@ -328,12 +330,7 @@ impl ModelWeights {
                 tensor.shape().to_vec()
             };
 
-            let is_2d_linear_weight = shape.len() == 2
-                && name.contains("weight")
-                && !name.contains("embed_tokens")
-                && !name.contains("norm");
-
-            if is_2d_linear_weight {
+            if is_quantizable_weight(&name, &shape) {
                 let tensor = self.weights.remove(&name).unwrap();
                 let f32_data = tensor.to_vec_f32();
                 let numel: usize = shape.iter().product();
@@ -347,7 +344,7 @@ impl ModelWeights {
         Ok(())
     }
 
-    /// Discover all `.safetensors` files in a directory, sorted by name.
+/// Discover all `.safetensors` files in a directory, sorted by name.
     ///
     /// If `path` is a file with the `.safetensors` extension, returns it directly.
     /// If `path` is a directory, collects all `.safetensors` files and sorts them.
