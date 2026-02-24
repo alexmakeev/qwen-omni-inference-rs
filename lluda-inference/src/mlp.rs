@@ -22,7 +22,7 @@
 //! - Element-wise multiplication combines the two paths
 //! - `down_proj` projects back to hidden dimension
 
-use crate::attention::Linear;
+use crate::attention::AnyLinear;
 use crate::error::Result;
 use crate::tensor::Tensor;
 
@@ -32,56 +32,51 @@ use crate::tensor::Tensor;
 #[derive(Debug, Clone)]
 pub struct MLP {
     /// Gate projection [intermediate_size, hidden_size]
-    gate_proj: Linear,
+    gate_proj: AnyLinear,
     /// Up projection [intermediate_size, hidden_size]
-    up_proj: Linear,
+    up_proj: AnyLinear,
     /// Down projection [hidden_size, intermediate_size]
-    down_proj: Linear,
+    down_proj: AnyLinear,
 }
 
 impl MLP {
-    /// Create a new MLP from weight tensors.
+    /// Create a new MLP from AnyLinear layers.
     ///
     /// # Arguments
     ///
-    /// * `gate_proj` - Gate projection weight [intermediate_size, hidden_size]
-    /// * `up_proj` - Up projection weight [intermediate_size, hidden_size]
-    /// * `down_proj` - Down projection weight [hidden_size, intermediate_size]
+    /// * `gate_proj` - Gate projection layer [intermediate_size, hidden_size]
+    /// * `up_proj` - Up projection layer [intermediate_size, hidden_size]
+    /// * `down_proj` - Down projection layer [hidden_size, intermediate_size]
     ///
     /// # Returns
     ///
-    /// New MLP instance or error if any weight tensor has invalid shape.
+    /// New MLP instance or error if shapes are incompatible.
     ///
     /// # Errors
     ///
     /// Returns `ShapeMismatch` if:
-    /// - Any weight is not 2D
     /// - gate_proj and up_proj have different shapes (must match)
     /// - down_proj input dimension doesn't match gate_proj/up_proj output dimension
     ///
     /// # Example
     ///
     /// ```rust
+    /// use lluda_inference::attention::{AnyLinear, Linear};
     /// use lluda_inference::mlp::MLP;
     /// use lluda_inference::tensor::Tensor;
     ///
     /// // Create MLP: 4 -> 8 -> 4
-    /// let gate_weight = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-    /// let up_weight = Tensor::new(vec![0.2; 32], vec![8, 4]).unwrap();
-    /// let down_weight = Tensor::new(vec![0.3; 32], vec![4, 8]).unwrap();
+    /// let gate_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap()).unwrap());
+    /// let up_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.2; 32], vec![8, 4]).unwrap()).unwrap());
+    /// let down_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.3; 32], vec![4, 8]).unwrap()).unwrap());
     ///
-    /// let mlp = MLP::new(gate_weight, up_weight, down_weight).unwrap();
+    /// let mlp = MLP::new(gate_proj, up_proj, down_proj).unwrap();
     /// ```
-    pub fn new(gate_proj: Tensor, up_proj: Tensor, down_proj: Tensor) -> Result<Self> {
-        // Validate all weights are 2D (Linear::new does this)
-        let gate_linear = Linear::new(gate_proj)?;
-        let up_linear = Linear::new(up_proj)?;
-        let down_linear = Linear::new(down_proj)?;
-
+    pub fn new(gate_proj: AnyLinear, up_proj: AnyLinear, down_proj: AnyLinear) -> Result<Self> {
         // Validate gate_proj and up_proj have same shape
         // Both are [intermediate_size, hidden_size]
-        let gate_shape = gate_linear.weight.shape();
-        let up_shape = up_linear.weight.shape();
+        let gate_shape = gate_proj.shape();
+        let up_shape = up_proj.shape();
 
         if gate_shape != up_shape {
             return Err(crate::error::LludaError::ShapeMismatch {
@@ -94,7 +89,7 @@ impl MLP {
         // down_proj is [hidden_size, intermediate_size]
         // gate/up output is intermediate_size (dim 0)
         let intermediate_size = gate_shape[0];
-        let down_shape = down_linear.weight.shape();
+        let down_shape = down_proj.shape();
 
         if down_shape[1] != intermediate_size {
             return Err(crate::error::LludaError::ShapeMismatch {
@@ -104,9 +99,9 @@ impl MLP {
         }
 
         Ok(MLP {
-            gate_proj: gate_linear,
-            up_proj: up_linear,
-            down_proj: down_linear,
+            gate_proj,
+            up_proj,
+            down_proj,
         })
     }
 
@@ -134,13 +129,14 @@ impl MLP {
     /// # Example
     ///
     /// ```rust
+    /// use lluda_inference::attention::{AnyLinear, Linear};
     /// use lluda_inference::mlp::MLP;
     /// use lluda_inference::tensor::Tensor;
     ///
-    /// # let gate_weight = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-    /// # let up_weight = Tensor::new(vec![0.2; 32], vec![8, 4]).unwrap();
-    /// # let down_weight = Tensor::new(vec![0.3; 32], vec![4, 8]).unwrap();
-    /// # let mlp = MLP::new(gate_weight, up_weight, down_weight).unwrap();
+    /// # let gate_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap()).unwrap());
+    /// # let up_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.2; 32], vec![8, 4]).unwrap()).unwrap());
+    /// # let down_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.3; 32], vec![4, 8]).unwrap()).unwrap());
+    /// # let mlp = MLP::new(gate_proj, up_proj, down_proj).unwrap();
     /// #
     /// // Input: batch_size=2, seq_len=3, hidden_size=4
     /// let x = Tensor::new(vec![1.0; 24], vec![2, 3, 4]).unwrap();
@@ -167,26 +163,28 @@ impl MLP {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::Linear;
     use crate::bf16::BF16;
     use crate::tensor::DType;
 
+    /// Helper: create an AnyLinear::F32 from f32 data and shape.
+    fn make_linear(data: Vec<f32>, shape: Vec<usize>) -> AnyLinear {
+        AnyLinear::F32(Linear::new(Tensor::new(data, shape).unwrap()).unwrap())
+    }
+
     #[test]
     fn mlp_constructor_validates_2d_weights() {
-        // gate_proj must be 2D
-        let gate = Tensor::new(vec![1.0; 8], vec![8]).unwrap(); // 1D - invalid
-        let up = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![1.0; 32], vec![4, 8]).unwrap();
-
-        let result = MLP::new(gate, up, down);
-        assert!(result.is_err(), "Should reject 1D gate_proj");
+        // Linear::new rejects 1D tensors — this validation now lives in Linear, not MLP.
+        let gate_result = Linear::new(Tensor::new(vec![1.0; 8], vec![8]).unwrap());
+        assert!(gate_result.is_err(), "Linear::new should reject 1D tensor");
     }
 
     #[test]
     fn mlp_constructor_validates_matching_shapes() {
         // gate_proj and up_proj must have same shape
-        let gate = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap(); // [8, 4]
-        let up = Tensor::new(vec![1.0; 40], vec![10, 4]).unwrap(); // [10, 4] - mismatch
-        let down = Tensor::new(vec![1.0; 32], vec![4, 8]).unwrap();
+        let gate = make_linear(vec![1.0; 32], vec![8, 4]); // [8, 4]
+        let up = AnyLinear::F32(Linear::new(Tensor::new(vec![1.0; 40], vec![10, 4]).unwrap()).unwrap()); // [10, 4] - mismatch
+        let down = make_linear(vec![1.0; 32], vec![4, 8]);
 
         let result = MLP::new(gate, up, down);
         assert!(
@@ -198,9 +196,9 @@ mod tests {
     #[test]
     fn mlp_constructor_validates_down_proj_compatibility() {
         // down_proj input must match gate/up output
-        let gate = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap(); // Output: 8
-        let up = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap(); // Output: 8
-        let down = Tensor::new(vec![1.0; 24], vec![4, 6]).unwrap(); // Input: 6 - mismatch!
+        let gate = make_linear(vec![1.0; 32], vec![8, 4]); // Output: 8
+        let up = make_linear(vec![1.0; 32], vec![8, 4]); // Output: 8
+        let down = AnyLinear::F32(Linear::new(Tensor::new(vec![1.0; 24], vec![4, 6]).unwrap()).unwrap()); // Input: 6 - mismatch!
 
         let result = MLP::new(gate, up, down);
         assert!(
@@ -211,9 +209,9 @@ mod tests {
 
     #[test]
     fn mlp_constructor_accepts_valid_weights() {
-        let gate = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![1.0; 32], vec![4, 8]).unwrap();
+        let gate = make_linear(vec![1.0; 32], vec![8, 4]);
+        let up = make_linear(vec![1.0; 32], vec![8, 4]);
+        let down = make_linear(vec![1.0; 32], vec![4, 8]);
 
         let mlp = MLP::new(gate, up, down);
         assert!(mlp.is_ok(), "Should accept valid weight tensors");
@@ -222,10 +220,11 @@ mod tests {
     #[test]
     fn test_mlp_shape_invariant() {
         // Test that output shape matches input shape
-        let gate = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.1; 32], vec![4, 8]).unwrap();
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![4, 8]),
+        ).unwrap();
 
         // Test with 1D batch
         let x = Tensor::new(vec![0.5; 4], vec![1, 4]).unwrap();
@@ -243,13 +242,11 @@ mod tests {
         // Verify that SiLU is applied to gate_proj output, not up_proj
         // Use identity-like weights for simplicity
         // gate_proj: [[1, 0], [0, 1]]
-        let gate = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-        // up_proj: [[1, 0], [0, 1]] (identity)
-        let up = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-        // down_proj: [[1, 0], [0, 1]] (identity)
-        let down = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+        ).unwrap();
 
         // Input: [1, 1]
         let x = Tensor::new(vec![1.0, 1.0], vec![1, 2]).unwrap();
@@ -279,11 +276,11 @@ mod tests {
     #[test]
     fn test_mlp_output_is_finite() {
         // Ensure output doesn't contain NaN or Inf
-        let gate = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.1; 32], vec![4, 8]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![4, 8]),
+        ).unwrap();
 
         let x = Tensor::new(vec![0.5; 2 * 4], vec![2, 4]).unwrap();
         let output = mlp.forward(&x).unwrap();
@@ -299,13 +296,11 @@ mod tests {
     fn test_mlp_element_wise_gating() {
         // Verify that gating is element-wise multiplication, not addition
         // gate_proj: multiply by 2: [[2, 0], [0, 2]]
-        let gate = Tensor::new(vec![2.0, 0.0, 0.0, 2.0], vec![2, 2]).unwrap();
-        // up_proj: multiply by 3: [[3, 0], [0, 3]]
-        let up = Tensor::new(vec![3.0, 0.0, 0.0, 3.0], vec![2, 2]).unwrap();
-        // down_proj: identity
-        let down = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![2.0, 0.0, 0.0, 2.0], vec![2, 2]),
+            make_linear(vec![3.0, 0.0, 0.0, 3.0], vec![2, 2]),
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+        ).unwrap();
 
         // Input: [1, 1]
         let x = Tensor::new(vec![1.0, 1.0], vec![1, 2]).unwrap();
@@ -342,11 +337,11 @@ mod tests {
     #[test]
     fn test_mlp_batched_3d_input() {
         // Test with realistic shape [B=2, L=3, hidden_size=4]
-        let gate = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.1; 32], vec![4, 8]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![4, 8]),
+        ).unwrap();
 
         let x = Tensor::new(vec![0.5; 2 * 3 * 4], vec![2, 3, 4]).unwrap();
         let output = mlp.forward(&x).unwrap();
@@ -361,11 +356,11 @@ mod tests {
     #[test]
     fn test_mlp_zero_input() {
         // Test with zero input
-        let gate = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.1; 32], vec![4, 8]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.1; 32], vec![4, 8]),
+        ).unwrap();
 
         let x = Tensor::new(vec![0.0; 4], vec![1, 4]).unwrap();
         let output = mlp.forward(&x).unwrap();
@@ -381,10 +376,11 @@ mod tests {
 
     #[test]
     fn mlp_forward_rejects_wrong_input_dim() {
-        let gate = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![1.0; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![1.0; 32], vec![4, 8]).unwrap();
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![1.0; 32], vec![8, 4]),
+            make_linear(vec![1.0; 32], vec![8, 4]),
+            make_linear(vec![1.0; 32], vec![4, 8]),
+        ).unwrap();
 
         // Wrong input dimension (should be 4, not 5)
         let x = Tensor::new(vec![1.0; 10], vec![2, 5]).unwrap();
@@ -400,9 +396,9 @@ mod tests {
         let up_bf16: Vec<BF16> = [0.2f32; 32].iter().map(|&x| BF16::from(x)).collect();
         let down_bf16: Vec<BF16> = [0.3f32; 32].iter().map(|&x| BF16::from(x)).collect();
 
-        let gate = Tensor::from_bf16(gate_bf16, vec![8, 4]).unwrap();
-        let up = Tensor::from_bf16(up_bf16, vec![8, 4]).unwrap();
-        let down = Tensor::from_bf16(down_bf16, vec![4, 8]).unwrap();
+        let gate = AnyLinear::F32(Linear::new(Tensor::from_bf16(gate_bf16, vec![8, 4]).unwrap()).unwrap());
+        let up = AnyLinear::F32(Linear::new(Tensor::from_bf16(up_bf16, vec![8, 4]).unwrap()).unwrap());
+        let down = AnyLinear::F32(Linear::new(Tensor::from_bf16(down_bf16, vec![4, 8]).unwrap()).unwrap());
 
         let mlp = MLP::new(gate, up, down).unwrap();
 
@@ -417,10 +413,11 @@ mod tests {
     #[test]
     fn mlp_forward_batch_dimension() {
         // Test with various batch shapes: [B, L, D]
-        let gate = Tensor::new(vec![0.1; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.2; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.3; 32], vec![4, 8]).unwrap();
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.1; 32], vec![8, 4]),
+            make_linear(vec![0.2; 32], vec![8, 4]),
+            make_linear(vec![0.3; 32], vec![4, 8]),
+        ).unwrap();
 
         // 1D: [4]
         let x1 = Tensor::new(vec![1.0; 4], vec![4]).unwrap();
@@ -445,10 +442,11 @@ mod tests {
 
     #[test]
     fn mlp_forward_no_nan_or_inf() {
-        let gate = Tensor::new(vec![0.5; 32], vec![8, 4]).unwrap();
-        let up = Tensor::new(vec![0.5; 32], vec![8, 4]).unwrap();
-        let down = Tensor::new(vec![0.5; 32], vec![4, 8]).unwrap();
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![0.5; 32], vec![8, 4]),
+            make_linear(vec![0.5; 32], vec![8, 4]),
+            make_linear(vec![0.5; 32], vec![4, 8]),
+        ).unwrap();
 
         // Random-ish input values
         let x_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
@@ -471,11 +469,11 @@ mod tests {
     fn mlp_qwen3_06b_dimensions() {
         // Test with actual Qwen3-0.6B dimensions
         // hidden_size = 1024, intermediate_size = 3072
-        let gate = Tensor::zeros(&[3072, 1024], DType::F32).unwrap();
-        let up = Tensor::zeros(&[3072, 1024], DType::F32).unwrap();
-        let down = Tensor::zeros(&[1024, 3072], DType::F32).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            AnyLinear::F32(Linear::new(Tensor::zeros(&[3072, 1024], DType::F32).unwrap()).unwrap()),
+            AnyLinear::F32(Linear::new(Tensor::zeros(&[3072, 1024], DType::F32).unwrap()).unwrap()),
+            AnyLinear::F32(Linear::new(Tensor::zeros(&[1024, 3072], DType::F32).unwrap()).unwrap()),
+        ).unwrap();
 
         // Input: [batch=2, seq_len=10, hidden_size=1024]
         let x = Tensor::zeros(&[2, 10, 1024], DType::F32).unwrap();
@@ -495,11 +493,11 @@ mod tests {
         // For negative x, SiLU is small but non-zero (approaches 0 as x -> -inf)
 
         // Use identity-like weights for predictability
-        let gate = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-        let up = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-        let down = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap();
-
-        let mlp = MLP::new(gate, up, down).unwrap();
+        let mlp = MLP::new(
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+            make_linear(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]),
+        ).unwrap();
 
         // Test values covering negative, zero, and positive range
         let test_values = vec![-5.0, -1.0, 0.0, 1.0, 5.0];

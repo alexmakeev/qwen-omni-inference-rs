@@ -265,6 +265,37 @@ impl Q8Linear {
     }
 }
 
+/// Unified linear layer supporting both BF16 and Q8_0 weights.
+/// Dispatches to the appropriate implementation at runtime.
+#[derive(Debug, Clone)]
+pub enum AnyLinear {
+    /// BF16 or F32 weights via standard Linear
+    F32(Linear),
+    /// Q8_0 quantized weights via Q8Linear
+    Q8(Q8Linear),
+}
+
+impl AnyLinear {
+    /// Forward pass — dispatches to the underlying implementation.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            AnyLinear::F32(linear) => linear.forward(x),
+            AnyLinear::Q8(q8linear) => q8linear.forward(x),
+        }
+    }
+
+    /// Returns the weight shape [out_features, in_features].
+    pub fn shape(&self) -> [usize; 2] {
+        match self {
+            AnyLinear::F32(linear) => {
+                let s = linear.weight.shape();
+                [s[0], s[1]]
+            }
+            AnyLinear::Q8(q8linear) => [q8linear.out_features, q8linear.in_features],
+        }
+    }
+}
+
 /// Grouped Query Attention with per-head Q/K normalization.
 ///
 /// Key features:
@@ -282,13 +313,13 @@ impl Q8Linear {
 #[derive(Debug, Clone)]
 pub struct Attention {
     /// Query projection [hidden_size, num_heads * head_dim]
-    q_proj: Linear,
+    q_proj: AnyLinear,
     /// Key projection [hidden_size, num_kv_heads * head_dim]
-    k_proj: Linear,
+    k_proj: AnyLinear,
     /// Value projection [hidden_size, num_kv_heads * head_dim]
-    v_proj: Linear,
+    v_proj: AnyLinear,
     /// Output projection [num_heads * head_dim, hidden_size]
-    o_proj: Linear,
+    o_proj: AnyLinear,
     /// Query normalization [head_dim]
     q_norm: RmsNorm,
     /// Key normalization [head_dim]
@@ -325,7 +356,7 @@ impl Attention {
     ///
     /// ```rust
     /// use std::sync::Arc;
-    /// use lluda_inference::attention::{Attention, Linear};
+    /// use lluda_inference::attention::{Attention, AnyLinear, Linear};
     /// use lluda_inference::rms_norm::RmsNorm;
     /// use lluda_inference::rope::RotaryEmbedding;
     /// use lluda_inference::tensor::Tensor;
@@ -335,10 +366,10 @@ impl Attention {
     /// let num_kv_heads = 2;
     /// let head_dim = 16;
     ///
-    /// let q_proj = Linear::new(Tensor::new(vec![0.0; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// let k_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// let v_proj = Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// let o_proj = Linear::new(Tensor::new(vec![0.0; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()).unwrap();
+    /// let q_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.0; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// let k_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// let v_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.0; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// let o_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.0; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()).unwrap());
     /// let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -347,10 +378,10 @@ impl Attention {
     /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        q_proj: Linear,
-        k_proj: Linear,
-        v_proj: Linear,
-        o_proj: Linear,
+        q_proj: AnyLinear,
+        k_proj: AnyLinear,
+        v_proj: AnyLinear,
+        o_proj: AnyLinear,
         q_norm: RmsNorm,
         k_norm: RmsNorm,
         rotary: Arc<RotaryEmbedding>,
@@ -368,10 +399,10 @@ impl Attention {
         }
 
         // Validate projection weight shapes
-        let q_shape = q_proj.weight.shape();
-        let k_shape = k_proj.weight.shape();
-        let v_shape = v_proj.weight.shape();
-        let o_shape = o_proj.weight.shape();
+        let q_shape = q_proj.shape();
+        let k_shape = k_proj.shape();
+        let v_shape = v_proj.shape();
+        let o_shape = o_proj.shape();
 
         if q_shape[0] != num_heads * head_dim {
             return Err(crate::error::LludaError::ShapeMismatch {
@@ -872,34 +903,34 @@ mod tests {
         let head_dim = 16;
 
         // Create attention layer
-        let q_proj = Linear::new(
+        let q_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_heads * head_dim * hidden_size],
                 vec![num_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let k_proj = Linear::new(
+        ).unwrap());
+        let k_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let v_proj = Linear::new(
+        ).unwrap());
+        let v_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let o_proj = Linear::new(
+        ).unwrap());
+        let o_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; hidden_size * num_heads * head_dim],
                 vec![hidden_size, num_heads * head_dim],
             )
             .unwrap(),
-        ).unwrap();
+        ).unwrap());
         let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -930,34 +961,34 @@ mod tests {
         let head_dim = 16;
 
         // Create attention layer
-        let q_proj = Linear::new(
+        let q_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_heads * head_dim * hidden_size],
                 vec![num_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let k_proj = Linear::new(
+        ).unwrap());
+        let k_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let v_proj = Linear::new(
+        ).unwrap());
+        let v_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let o_proj = Linear::new(
+        ).unwrap());
+        let o_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; hidden_size * num_heads * head_dim],
                 vec![hidden_size, num_heads * head_dim],
             )
             .unwrap(),
-        ).unwrap();
+        ).unwrap());
         let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -1012,34 +1043,34 @@ mod tests {
         let head_dim = 16;
 
         // Create attention layer
-        let q_proj = Linear::new(
+        let q_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_heads * head_dim * hidden_size],
                 vec![num_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let k_proj = Linear::new(
+        ).unwrap());
+        let k_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let v_proj = Linear::new(
+        ).unwrap());
+        let v_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let o_proj = Linear::new(
+        ).unwrap());
+        let o_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; hidden_size * num_heads * head_dim],
                 vec![hidden_size, num_heads * head_dim],
             )
             .unwrap(),
-        ).unwrap();
+        ).unwrap());
         let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -1184,34 +1215,34 @@ mod tests {
         let head_dim = 16;
 
         // Create attention layer
-        let q_proj = Linear::new(
+        let q_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_heads * head_dim * hidden_size],
                 vec![num_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let k_proj = Linear::new(
+        ).unwrap());
+        let k_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let v_proj = Linear::new(
+        ).unwrap());
+        let v_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let o_proj = Linear::new(
+        ).unwrap());
+        let o_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; hidden_size * num_heads * head_dim],
                 vec![hidden_size, num_heads * head_dim],
             )
             .unwrap(),
-        ).unwrap();
+        ).unwrap());
         let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -1265,34 +1296,34 @@ mod tests {
         let num_kv_heads = 2;
         let head_dim = 16;
 
-        let q_proj = Linear::new(
+        let q_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_heads * head_dim * hidden_size],
                 vec![num_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let k_proj = Linear::new(
+        ).unwrap());
+        let k_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let v_proj = Linear::new(
+        ).unwrap());
+        let v_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; num_kv_heads * head_dim * hidden_size],
                 vec![num_kv_heads * head_dim, hidden_size],
             )
             .unwrap(),
-        ).unwrap();
-        let o_proj = Linear::new(
+        ).unwrap());
+        let o_proj = AnyLinear::F32(Linear::new(
             Tensor::new(
                 vec![0.1; hidden_size * num_heads * head_dim],
                 vec![hidden_size, num_heads * head_dim],
             )
             .unwrap(),
-        ).unwrap();
+        ).unwrap());
         let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());

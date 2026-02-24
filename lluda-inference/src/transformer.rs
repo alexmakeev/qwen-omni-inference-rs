@@ -56,7 +56,7 @@ impl DecoderLayer {
     /// ```rust
     /// use std::sync::Arc;
     /// use lluda_inference::transformer::DecoderLayer;
-    /// use lluda_inference::attention::{Attention, Linear};
+    /// use lluda_inference::attention::{Attention, AnyLinear, Linear};
     /// use lluda_inference::mlp::MLP;
     /// use lluda_inference::rms_norm::RmsNorm;
     /// use lluda_inference::rope::RotaryEmbedding;
@@ -69,18 +69,18 @@ impl DecoderLayer {
     /// let head_dim = 16;
     ///
     /// // Create attention layer components
-    /// let q_proj = Linear::new(
+    /// let q_proj = AnyLinear::F32(Linear::new(
     ///     Tensor::new(vec![0.1; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()
-    /// ).unwrap();
-    /// let k_proj = Linear::new(
+    /// ).unwrap());
+    /// let k_proj = AnyLinear::F32(Linear::new(
     ///     Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()
-    /// ).unwrap();
-    /// let v_proj = Linear::new(
+    /// ).unwrap());
+    /// let v_proj = AnyLinear::F32(Linear::new(
     ///     Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()
-    /// ).unwrap();
-    /// let o_proj = Linear::new(
+    /// ).unwrap());
+    /// let o_proj = AnyLinear::F32(Linear::new(
     ///     Tensor::new(vec![0.1; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()
-    /// ).unwrap();
+    /// ).unwrap());
     /// let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
@@ -88,9 +88,9 @@ impl DecoderLayer {
     /// let self_attn = Attention::new(q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads, head_dim).unwrap();
     ///
     /// // Create MLP components
-    /// let gate_proj = Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap();
-    /// let up_proj = Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap();
-    /// let down_proj = Tensor::new(vec![0.1; hidden_size * intermediate_size], vec![hidden_size, intermediate_size]).unwrap();
+    /// let gate_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap()).unwrap());
+    /// let up_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap()).unwrap());
+    /// let down_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; hidden_size * intermediate_size], vec![hidden_size, intermediate_size]).unwrap()).unwrap());
     /// let mlp = MLP::new(gate_proj, up_proj, down_proj).unwrap();
     ///
     /// // Create normalization layers
@@ -144,7 +144,7 @@ impl DecoderLayer {
     /// ```rust
     /// use std::sync::Arc;
     /// use lluda_inference::transformer::DecoderLayer;
-    /// use lluda_inference::attention::{Attention, Linear, KvCache};
+    /// use lluda_inference::attention::{Attention, AnyLinear, Linear, KvCache};
     /// use lluda_inference::mlp::MLP;
     /// use lluda_inference::rms_norm::RmsNorm;
     /// use lluda_inference::rope::RotaryEmbedding;
@@ -156,17 +156,17 @@ impl DecoderLayer {
     /// # let num_heads = 4;
     /// # let num_kv_heads = 2;
     /// # let head_dim = 16;
-    /// # let q_proj = Linear::new(Tensor::new(vec![0.1; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// # let k_proj = Linear::new(Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// # let v_proj = Linear::new(Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap();
-    /// # let o_proj = Linear::new(Tensor::new(vec![0.1; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()).unwrap();
+    /// # let q_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; num_heads * head_dim * hidden_size], vec![num_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// # let k_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// # let v_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; num_kv_heads * head_dim * hidden_size], vec![num_kv_heads * head_dim, hidden_size]).unwrap()).unwrap());
+    /// # let o_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; hidden_size * num_heads * head_dim], vec![hidden_size, num_heads * head_dim]).unwrap()).unwrap());
     /// # let q_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// # let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// # let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
     /// # let self_attn = Attention::new(q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads, head_dim).unwrap();
-    /// # let gate_proj = Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap();
-    /// # let up_proj = Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap();
-    /// # let down_proj = Tensor::new(vec![0.1; hidden_size * intermediate_size], vec![hidden_size, intermediate_size]).unwrap();
+    /// # let gate_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap()).unwrap());
+    /// # let up_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; intermediate_size * hidden_size], vec![intermediate_size, hidden_size]).unwrap()).unwrap());
+    /// # let down_proj = AnyLinear::F32(Linear::new(Tensor::new(vec![0.1; hidden_size * intermediate_size], vec![hidden_size, intermediate_size]).unwrap()).unwrap());
     /// # let mlp = MLP::new(gate_proj, up_proj, down_proj).unwrap();
     /// # let input_layernorm = RmsNorm::new(Tensor::new(vec![1.0; hidden_size], vec![hidden_size]).unwrap(), 1e-6).unwrap();
     /// # let post_attention_layernorm = RmsNorm::new(Tensor::new(vec![1.0; hidden_size], vec![hidden_size]).unwrap(), 1e-6).unwrap();
@@ -207,9 +207,13 @@ impl DecoderLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attention::Linear;
+    use crate::attention::{AnyLinear, Linear};
     use crate::rope::RotaryEmbedding;
     use std::sync::Arc;
+
+    fn make_any_linear(data: Vec<f32>, shape: Vec<usize>) -> AnyLinear {
+        AnyLinear::F32(Linear::new(Tensor::new(data, shape).unwrap()).unwrap())
+    }
 
     fn create_test_decoder_layer(
         hidden_size: usize,
@@ -219,38 +223,22 @@ mod tests {
         head_dim: usize,
     ) -> DecoderLayer {
         // Create attention layer
-        let q_proj = Linear::new(
-            Tensor::new(
-                vec![0.1; num_heads * head_dim * hidden_size],
-                vec![num_heads * head_dim, hidden_size],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let k_proj = Linear::new(
-            Tensor::new(
-                vec![0.1; num_kv_heads * head_dim * hidden_size],
-                vec![num_kv_heads * head_dim, hidden_size],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let v_proj = Linear::new(
-            Tensor::new(
-                vec![0.1; num_kv_heads * head_dim * hidden_size],
-                vec![num_kv_heads * head_dim, hidden_size],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let o_proj = Linear::new(
-            Tensor::new(
-                vec![0.1; hidden_size * num_heads * head_dim],
-                vec![hidden_size, num_heads * head_dim],
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let q_proj = make_any_linear(
+            vec![0.1; num_heads * head_dim * hidden_size],
+            vec![num_heads * head_dim, hidden_size],
+        );
+        let k_proj = make_any_linear(
+            vec![0.1; num_kv_heads * head_dim * hidden_size],
+            vec![num_kv_heads * head_dim, hidden_size],
+        );
+        let v_proj = make_any_linear(
+            vec![0.1; num_kv_heads * head_dim * hidden_size],
+            vec![num_kv_heads * head_dim, hidden_size],
+        );
+        let o_proj = make_any_linear(
+            vec![0.1; hidden_size * num_heads * head_dim],
+            vec![hidden_size, num_heads * head_dim],
+        );
         let q_norm = RmsNorm::new(
             Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(),
             1e-6,
@@ -269,21 +257,18 @@ mod tests {
         ).unwrap();
 
         // Create MLP layer
-        let gate_proj = Tensor::new(
+        let gate_proj = make_any_linear(
             vec![0.1; intermediate_size * hidden_size],
             vec![intermediate_size, hidden_size],
-        )
-        .unwrap();
-        let up_proj = Tensor::new(
+        );
+        let up_proj = make_any_linear(
             vec![0.1; intermediate_size * hidden_size],
             vec![intermediate_size, hidden_size],
-        )
-        .unwrap();
-        let down_proj = Tensor::new(
+        );
+        let down_proj = make_any_linear(
             vec![0.1; hidden_size * intermediate_size],
             vec![hidden_size, intermediate_size],
-        )
-        .unwrap();
+        );
         let mlp = MLP::new(gate_proj, up_proj, down_proj).unwrap();
 
         // Create normalization layers

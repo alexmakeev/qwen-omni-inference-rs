@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use crate::attention::{Attention, KvCache, Linear};
+use crate::attention::{AnyLinear, Attention, KvCache, Linear, Q8Linear};
 use crate::causal_mask::causal_mask;
 use crate::config::Qwen3Config;
 use crate::embedding::Embedding;
@@ -301,6 +301,46 @@ impl Qwen3ForCausalLM {
         })
     }
 
+    /// Load Qwen3ForCausalLM with Q8_0 quantized linear layers.
+    ///
+    /// Equivalent to `load()` but loads weights via `ModelWeights::from_safetensors_q8`,
+    /// so all 2D weight tensors (attention projections, MLP projections) are quantized
+    /// to Q8_0. Embeddings and norm weights stay in their original dtype.
+    ///
+    /// The underlying `load_decoder_layer` automatically detects Q8_0 tensors via
+    /// `make_linear()` and wraps them in `AnyLinear::Q8`.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Model configuration
+    /// * `weights` - Loaded model weights (Q8_0-quantized) from `from_safetensors_q8`
+    ///
+    /// # Returns
+    ///
+    /// Initialized model with Q8_0 quantized linear layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if model loading fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::config::Qwen3Config;
+    /// use lluda_inference::loader::ModelWeights;
+    /// use lluda_inference::model::Qwen3ForCausalLM;
+    ///
+    /// let config = Qwen3Config::from_file("models/Qwen3-0.6B/config.json")?;
+    /// let weights = ModelWeights::from_safetensors_q8("models/Qwen3-0.6B/model.safetensors")?;
+    /// let model = Qwen3ForCausalLM::load_q8(&config, &weights)?;
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn load_q8(config: &Qwen3Config, weights: &ModelWeights) -> Result<Self> {
+        // The load path is identical — make_linear() inside load_decoder_layer
+        // detects Q8_0 dtype and wraps in AnyLinear::Q8 automatically.
+        Self::load(config, weights)
+    }
+
     /// Forward pass: token IDs -> logits for next token.
     ///
     /// # Arguments
@@ -424,6 +464,17 @@ impl Qwen3ForCausalLM {
     }
 }
 
+/// Create the appropriate AnyLinear variant for a weight tensor.
+///
+/// Q8_0 tensors become Q8Linear; all other dtypes become Linear (BF16/F32).
+/// This allows the same loader to handle both quantized and non-quantized models.
+fn make_linear(weight: Tensor) -> Result<AnyLinear> {
+    match weight.dtype() {
+        DType::Q8_0 => Ok(AnyLinear::Q8(Q8Linear::new(weight)?)),
+        _ => Ok(AnyLinear::F32(Linear::new(weight)?)),
+    }
+}
+
 /// Load a single decoder layer from weights.
 ///
 /// # Arguments
@@ -462,10 +513,10 @@ fn load_decoder_layer(
         .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.o_proj.weight", prefix)))?
         .clone();
 
-    let q_proj = Linear::new(q_proj_weight)?;
-    let k_proj = Linear::new(k_proj_weight)?;
-    let v_proj = Linear::new(v_proj_weight)?;
-    let o_proj = Linear::new(o_proj_weight)?;
+    let q_proj = make_linear(q_proj_weight)?;
+    let k_proj = make_linear(k_proj_weight)?;
+    let v_proj = make_linear(v_proj_weight)?;
+    let o_proj = make_linear(o_proj_weight)?;
 
     // Load Q/K norms
     let q_norm_weight = weights
@@ -508,7 +559,10 @@ fn load_decoder_layer(
         .ok_or_else(|| LludaError::Msg(format!("Missing {}.mlp.down_proj.weight", prefix)))?
         .clone();
 
-    let mlp = MLP::new(gate_proj_weight, up_proj_weight, down_proj_weight)?;
+    let gate_proj = make_linear(gate_proj_weight)?;
+    let up_proj = make_linear(up_proj_weight)?;
+    let down_proj = make_linear(down_proj_weight)?;
+    let mlp = MLP::new(gate_proj, up_proj, down_proj)?;
 
     // Load layer norms
     let input_layernorm_weight = weights
