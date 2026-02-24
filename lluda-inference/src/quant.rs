@@ -775,4 +775,402 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Integration tests: Q8_0 pipeline end-to-end
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Helper: compute cosine similarity between two slices.
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "cosine_similarity: length mismatch");
+        let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 0.0;
+        }
+        dot / (norm_a * norm_b)
+    }
+
+    /// Helper: compute reference f32 matmul given dequantized weights.
+    /// Weight layout: [out, in], input layout: [batch, in].
+    fn ref_matmul_f32(x: &[f32], w: &[f32], batch: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; batch * n];
+        for i in 0..batch {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += x[i * k + l] * w[j * k + l];
+                }
+                out[i * n + j] = sum;
+            }
+        }
+        out
+    }
+
+    // ── Test 1: Tensor F32 → Q8_0 → F32 roundtrip ──────────────────────────
+
+    #[test]
+    fn test_tensor_f32_to_q8_roundtrip() {
+        use crate::tensor::{DType, Tensor};
+
+        // 64 deterministic f32 values shaped [2, 32].
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 * 0.05).sin()).collect();
+        let original = data.clone();
+
+        let t = Tensor::new(data, vec![2, 32]).unwrap();
+        assert_eq!(t.dtype(), DType::F32, "initial dtype should be F32");
+        assert_eq!(t.shape(), &[2, 32], "initial shape should be [2, 32]");
+
+        // Convert F32 -> Q8_0.
+        let t_q8 = t.to_dtype(DType::Q8_0).unwrap();
+        assert_eq!(t_q8.dtype(), DType::Q8_0,
+            "after to_dtype(Q8_0) dtype should be Q8_0, got {:?}", t_q8.dtype());
+        assert_eq!(t_q8.shape(), &[2, 32],
+            "shape after Q8_0 conversion should be [2, 32], got {:?}", t_q8.shape());
+
+        // Convert Q8_0 -> F32.
+        let t_f32 = t_q8.to_dtype(DType::F32).unwrap();
+        assert_eq!(t_f32.dtype(), DType::F32,
+            "after to_dtype(F32) dtype should be F32, got {:?}", t_f32.dtype());
+        assert_eq!(t_f32.shape(), &[2, 32],
+            "shape after F32 recovery should be [2, 32], got {:?}", t_f32.shape());
+
+        // Compute MSE between original and roundtrip values.
+        let recovered = t_f32.to_vec_f32();
+        assert_eq!(recovered.len(), 64, "recovered vector should have 64 elements");
+        let mse: f32 = original.iter().zip(recovered.iter())
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f32>()
+            / 64.0;
+        assert!(
+            mse < 1e-3,
+            "MSE {} between original and Q8 roundtrip exceeds 1e-3",
+            mse
+        );
+    }
+
+    // ── Test 2: Tensor from Q8 blocks → to_vec_f32 ──────────────────────────
+
+    #[test]
+    fn test_tensor_q8_to_vec_f32() {
+        use crate::tensor::Tensor;
+
+        // Known values: 32 values in [−1, 1], one block.
+        let mut values = [0.0f32; 32];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = (i as f32 * 0.2).cos();
+        }
+
+        let block = Q8Block::quantize(&values);
+        let expected_deq = block.dequantize();
+
+        // Wrap in a Tensor via from_q8_blocks.
+        let t = Tensor::from_q8_blocks(vec![block], 32, vec![32]).unwrap();
+
+        let result = t.to_vec_f32();
+        assert_eq!(result.len(), 32,
+            "to_vec_f32 should return 32 elements, got {}", result.len());
+
+        // Each element should match the dequantized block value.
+        for i in 0..32 {
+            let err = (result[i] - expected_deq[i]).abs();
+            assert!(
+                err < 1e-6,
+                "to_vec_f32[{}]: expected {}, got {}, diff {}",
+                i, expected_deq[i], result[i], err
+            );
+        }
+    }
+
+    // ── Test 3: Tensor into_q8_blocks ────────────────────────────────────────
+
+    #[test]
+    fn test_tensor_into_q8_blocks() {
+        use crate::tensor::Tensor;
+
+        // Two blocks (64 values).
+        let blocks_in: Vec<Q8Block> = (0..2usize)
+            .map(|b| {
+                let mut vals = [0.0f32; 32];
+                for (i, v) in vals.iter_mut().enumerate() {
+                    *v = ((b * 32 + i) as f32 * 0.1).sin();
+                }
+                Q8Block::quantize(&vals)
+            })
+            .collect();
+
+        let t = Tensor::from_q8_blocks(blocks_in.clone(), 64, vec![2, 32]).unwrap();
+
+        let blocks_out = t.into_q8_blocks().unwrap();
+        assert_eq!(
+            blocks_out.len(), 2,
+            "into_q8_blocks should return 2 blocks, got {}", blocks_out.len()
+        );
+
+        // Block scale bits should match exactly (we put them in, should get them back).
+        for b in 0..2 {
+            assert_eq!(
+                blocks_out[b].scale_bits, blocks_in[b].scale_bits,
+                "Block {} scale_bits mismatch: expected {}, got {}",
+                b, blocks_in[b].scale_bits, blocks_out[b].scale_bits
+            );
+            for q in 0..32 {
+                assert_eq!(
+                    blocks_out[b].quants[q], blocks_in[b].quants[q],
+                    "Block {} quants[{}] mismatch: expected {}, got {}",
+                    b, q, blocks_in[b].quants[q], blocks_out[b].quants[q]
+                );
+            }
+        }
+    }
+
+    // ── Test 4: Q8Linear forward — identity approximation ──────────────────
+
+    #[test]
+    fn test_q8linear_forward_identity() {
+        use crate::attention::Q8Linear;
+        use crate::tensor::Tensor;
+
+        // 32x32 identity matrix: W[i, j] = 1.0 if i == j else 0.0.
+        // Each row is 32 values (1 block). There are 32 rows.
+        let mut w_f32 = vec![0.0f32; 32 * 32];
+        for i in 0..32 {
+            w_f32[i * 32 + i] = 1.0;
+        }
+
+        // Quantize: 32 rows × 1 block each = 32 blocks total.
+        let blocks = quantize_f32_to_q8(&w_f32);
+        assert_eq!(blocks.len(), 32,
+            "identity matrix should produce 32 blocks, got {}", blocks.len());
+
+        let q8lin = Q8Linear::from_blocks(blocks, 32, 32).unwrap();
+
+        // Input: [1, 32] tensor with known values.
+        let input_data: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 + 0.5).collect();
+        let x = Tensor::new(input_data.clone(), vec![1, 32]).unwrap();
+
+        let out = q8lin.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[1, 32],
+            "output shape should be [1, 32], got {:?}", out.shape());
+
+        // For an identity matrix, output ≈ input (within Q8 tolerance).
+        let out_vec = out.to_vec_f32();
+        for i in 0..32 {
+            let err = (out_vec[i] - input_data[i]).abs();
+            // Q8 tolerance: scale ≈ 1/127 ≈ 0.008 per step.
+            // For identity diagonal entry 1.0, quant error ≈ 0.008.
+            // For input values up to ~3.6, absolute output error ≈ input * quant_error ≈ 0.03.
+            assert!(
+                err < 0.1,
+                "identity forward[{}]: expected {}, got {}, error {} > 0.1",
+                i, input_data[i], out_vec[i], err
+            );
+        }
+    }
+
+    // ── Test 5: Q8Linear forward vs F32 Linear (same weights) ───────────────
+
+    #[test]
+    fn test_q8linear_forward_vs_linear() {
+        use crate::attention::{Linear, Q8Linear};
+        use crate::tensor::Tensor;
+
+        let out_features = 64usize;
+        let in_features = 32usize;
+
+        // Deterministic weight matrix with sin/cos pattern.
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| {
+                let t = i as f32 * 0.07;
+                if i % 2 == 0 { t.sin() } else { t.cos() }
+            })
+            .collect();
+
+        // F32 Linear.
+        let w_tensor_f32 = Tensor::new(w_f32.clone(), vec![out_features, in_features]).unwrap();
+        let linear_f32 = Linear::new(w_tensor_f32).unwrap();
+
+        // Q8Linear from quantized blocks.
+        let blocks = quantize_f32_to_q8(&w_f32);
+        let q8lin = Q8Linear::from_blocks(blocks, out_features, in_features).unwrap();
+
+        // Input: [1, 32] tensor.
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| (i as f32 * 0.15 + 0.3).sin())
+            .collect();
+        let x = Tensor::new(x_data.clone(), vec![1, in_features]).unwrap();
+
+        // Forward through both.
+        let out_f32 = linear_f32.forward(&x).unwrap().to_vec_f32();
+        let out_q8 = q8lin.forward(&x).unwrap().to_vec_f32();
+
+        assert_eq!(out_f32.len(), out_features);
+        assert_eq!(out_q8.len(), out_features);
+
+        // Cosine similarity should be very high.
+        let cos_sim = cosine_similarity(&out_f32, &out_q8);
+        assert!(
+            cos_sim > 0.999,
+            "cosine similarity between F32 and Q8 output: {} < 0.999",
+            cos_sim
+        );
+
+        // Max relative error should be within Q8_0 quantization tolerance.
+        // Q8_0 introduces ~1/127 ≈ 0.8% error per weight element; accumulated
+        // over a dot product of 32 values this can reach ~2% on individual outputs.
+        // We use 2% as a practical upper bound for this pattern.
+        let mut max_rel_err = 0.0f32;
+        for i in 0..out_features {
+            let err = rel_error(out_f32[i], out_q8[i]);
+            if err > max_rel_err {
+                max_rel_err = err;
+            }
+        }
+        assert!(
+            max_rel_err < 0.02,
+            "max relative error between F32 and Q8 output: {} > 2%",
+            max_rel_err
+        );
+    }
+
+    // ── Test 6: AnyLinear dispatch — F32 and Q8 produce same results ─────────
+
+    #[test]
+    fn test_anylinear_dispatch() {
+        use crate::attention::{AnyLinear, Linear, Q8Linear};
+        use crate::tensor::Tensor;
+
+        let out_features = 32usize;
+        let in_features = 64usize;
+
+        // Deterministic weights.
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32 * 0.09).sin()) * 0.5)
+            .collect();
+
+        // AnyLinear::F32
+        let w_tensor = Tensor::new(w_f32.clone(), vec![out_features, in_features]).unwrap();
+        let any_f32 = AnyLinear::F32(Linear::new(w_tensor).unwrap());
+
+        // AnyLinear::Q8 — same weights, quantized.
+        let blocks = quantize_f32_to_q8(&w_f32);
+        let q8lin = Q8Linear::from_blocks(blocks, out_features, in_features).unwrap();
+        let any_q8 = AnyLinear::Q8(q8lin);
+
+        // Input: [1, 64] tensor.
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| (i as f32 * 0.11 + 0.1).cos() * 0.8)
+            .collect();
+        let x = Tensor::new(x_data, vec![1, in_features]).unwrap();
+
+        let out_f32 = any_f32.forward(&x).unwrap().to_vec_f32();
+        let out_q8 = any_q8.forward(&x).unwrap().to_vec_f32();
+
+        assert_eq!(out_f32.len(), out_features,
+            "F32 output length should be {}, got {}", out_features, out_f32.len());
+        assert_eq!(out_q8.len(), out_features,
+            "Q8 output length should be {}, got {}", out_features, out_q8.len());
+
+        // Both enum arms should produce close results.
+        let cos_sim = cosine_similarity(&out_f32, &out_q8);
+        assert!(
+            cos_sim > 0.999,
+            "AnyLinear dispatch: cosine similarity {} < 0.999 — F32 and Q8 outputs diverged",
+            cos_sim
+        );
+    }
+
+    // ── Test 7: Q8Linear batched forward ─────────────────────────────────────
+
+    #[test]
+    fn test_q8linear_batched() {
+        use crate::attention::Q8Linear;
+        use crate::tensor::Tensor;
+
+        let out_features = 32usize;
+        let in_features = 64usize;
+
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| (i as f32 * 0.05).sin() * 0.3)
+            .collect();
+        let blocks = quantize_f32_to_q8(&w_f32);
+        let q8lin = Q8Linear::from_blocks(blocks, out_features, in_features).unwrap();
+
+        // 2D batch: [4, 64] → [4, 32].
+        let x_2d_data: Vec<f32> = (0..4 * in_features)
+            .map(|i| (i as f32 * 0.03 + 0.2).cos())
+            .collect();
+        let x_2d = Tensor::new(x_2d_data, vec![4, in_features]).unwrap();
+        let out_2d = q8lin.forward(&x_2d).unwrap();
+        assert_eq!(
+            out_2d.shape(), &[4, 32],
+            "2D batched output shape should be [4, 32], got {:?}", out_2d.shape()
+        );
+
+        // 3D batch: [2, 3, 64] → [2, 3, 32].
+        let x_3d_data: Vec<f32> = (0..2 * 3 * in_features)
+            .map(|i| (i as f32 * 0.04 + 0.1).sin())
+            .collect();
+        let x_3d = Tensor::new(x_3d_data, vec![2, 3, in_features]).unwrap();
+        let out_3d = q8lin.forward(&x_3d).unwrap();
+        assert_eq!(
+            out_3d.shape(), &[2, 3, 32],
+            "3D batched output shape should be [2, 3, 32], got {:?}", out_3d.shape()
+        );
+    }
+
+    // ── Test 8: Q8 matmul accumulation accuracy over many blocks ─────────────
+
+    #[test]
+    fn test_q8_matmul_accumulation_accuracy() {
+        // Weight [128, 256]: 128 output neurons, 256 input features.
+        // Each row has 256/32 = 8 blocks. Total: 128 × 8 = 1024 blocks.
+        let out_features = 128usize;
+        let in_features = 256usize;
+
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| {
+                let t = i as f32 * 0.031;
+                t.sin() * 0.4
+            })
+            .collect();
+
+        // Quantize the weights.
+        let w_blocks = quantize_f32_to_q8(&w_f32);
+        assert_eq!(
+            w_blocks.len(), out_features * (in_features / 32),
+            "expected {} blocks, got {}",
+            out_features * (in_features / 32), w_blocks.len()
+        );
+
+        // Input: [1, 256].
+        let x: Vec<f32> = (0..in_features)
+            .map(|i| (i as f32 * 0.023 + 0.5).cos() * 0.6)
+            .collect();
+
+        // Q8 matmul result.
+        let out_q8 = matmul_f32_x_quant::<Q8Block>(&x, &w_blocks, 1, in_features, out_features);
+
+        // Reference: dequantize all blocks and do f32 matmul.
+        let mut w_deq = vec![0.0f32; out_features * in_features];
+        for (b_idx, block) in w_blocks.iter().enumerate() {
+            let deq = block.dequantize();
+            let start = b_idx * 32;
+            let end = (start + 32).min(w_deq.len());
+            w_deq[start..end].copy_from_slice(&deq[..end - start]);
+        }
+        let out_ref = ref_matmul_f32(&x, &w_deq, 1, in_features, out_features);
+
+        assert_eq!(out_q8.len(), out_features);
+        assert_eq!(out_ref.len(), out_features);
+
+        // Cosine similarity over output vectors.
+        let cos_sim = cosine_similarity(&out_ref, &out_q8);
+        assert!(
+            cos_sim > 0.999,
+            "accumulation accuracy: cosine similarity {} < 0.999",
+            cos_sim
+        );
+    }
 }
