@@ -8,6 +8,7 @@
 // Phase 0: Infrastructure modules
 pub mod error;
 pub mod bf16;
+pub mod quant;
 pub mod tensor;
 pub mod config;
 pub mod tokenizer;
