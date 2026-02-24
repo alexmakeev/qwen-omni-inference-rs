@@ -140,6 +140,7 @@ impl Linear {
 ///
 /// Weights are stored as Q8_0 blocks in [out_features, in_features] layout.
 /// Uses fused matmul_f32_x_quant — no dequantization during inference.
+#[derive(Debug, Clone)]
 pub struct Q8Linear {
     /// Q8_0 quantized weight blocks, [out_features, in_features] layout
     /// Stored as out_features rows of (in_features/32) blocks each
@@ -161,6 +162,12 @@ impl Q8Linear {
         out_features: usize,
         in_features: usize,
     ) -> crate::error::Result<Self> {
+        if in_features % 32 != 0 {
+            return Err(crate::error::LludaError::Msg(
+                format!("Q8Linear: in_features ({}) must be a multiple of 32 for Q8_0 block alignment",
+                        in_features)
+            ));
+        }
         let blocks_per_row = (in_features + 31) / 32;
         let expected_blocks = out_features * blocks_per_row;
         if blocks.len() != expected_blocks {
@@ -231,11 +238,19 @@ impl Q8Linear {
 
         // Flatten to 2D: [batch, in_features]
         let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
-        let x_f32 = x.to_vec_f32();
+        // Zero-copy for F32 tensors (common case — activations are always F32)
+        let x_owned;
+        let x_data: &[f32] = match x.as_f32_slice() {
+            Some(slice) => slice,
+            None => {
+                x_owned = x.to_vec_f32();
+                &x_owned
+            }
+        };
 
         // Fused Q8 matmul: [batch, K] x [N, K/32 blocks] -> [batch, N]
         let out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q8Block>(
-            &x_f32,
+            x_data,
             &self.weight_blocks,
             batch,
             self.in_features,

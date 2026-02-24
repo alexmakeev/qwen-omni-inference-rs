@@ -115,10 +115,21 @@ pub fn fp16_to_f32(bits: u16) -> f32 {
             let f32_bits: u32 = sign << 31;
             f32::from_bits(f32_bits)
         } else {
-            // Denormal: no implicit leading 1.
-            // Convert to normalized f32.
-            // value = sign * mantissa * 2^(-14-10) = sign * mantissa * 2^(-24)
-            let f32_bits: u32 = (sign << 31) | ((127 - 24) << 23) | (mantissa << 13);
+            // Denormal FP16: value = (-1)^sign * mantissa * 2^(-14) / 1024
+            // = (-1)^sign * mantissa * 2^(-24)
+            // Normalize by finding the leading 1 bit in mantissa.
+            let mut m = mantissa;
+            let mut e: i32 = -14; // FP16 denormal exponent is 2^(-14)
+            // Shift mantissa left until bit 10 is set (the implicit leading 1 position).
+            while m & (1 << 10) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            // Remove the implicit leading 1.
+            m &= 0x3FF;
+            // Convert to f32 biased exponent.
+            let f32_exp = ((e + 127) as u32) & 0xFF;
+            let f32_bits: u32 = (sign << 31) | (f32_exp << 23) | (m << 13);
             f32::from_bits(f32_bits)
         }
     } else if exp == 31 {
@@ -677,6 +688,38 @@ mod tests {
                 idx, ref_out[idx], out_quant[idx], err
             );
         }
+    }
+
+    #[test]
+    fn test_fp16_denormal_values() {
+        // FP16 denormal: exponent=0, mantissa=m → value = m * 2^(-24)
+        // Minimum denormal: mantissa=1 → 2^(-24) ≈ 5.96e-8
+        let min_denorm = fp16_to_f32(0x0001);
+        assert!((min_denorm - 5.960464e-8).abs() < 1e-12, "min denormal: {}", min_denorm);
+
+        // Mantissa=512 → 512 * 2^(-24) = 2^(-15) ≈ 3.0517578e-5
+        let mid_denorm = fp16_to_f32(0x0200);
+        let expected = 512.0 * f32::powi(2.0, -24);
+        assert!((mid_denorm - expected).abs() / expected < 1e-6,
+                "mid denormal: got {}, expected {}", mid_denorm, expected);
+
+        // Mantissa=1023 (max denormal) → 1023 * 2^(-24) ≈ 6.097555e-5
+        let max_denorm = fp16_to_f32(0x03FF);
+        let expected_max = 1023.0 * f32::powi(2.0, -24);
+        assert!((max_denorm - expected_max).abs() / expected_max < 1e-6,
+                "max denormal: got {}, expected {}", max_denorm, expected_max);
+
+        // Negative denormal
+        let neg_denorm = fp16_to_f32(0x8200); // sign=1, exp=0, mantissa=512
+        assert!((neg_denorm + expected).abs() / expected < 1e-6,
+                "neg denormal: got {}, expected {}", neg_denorm, -expected);
+
+        // Roundtrip: f32 → fp16 → f32 for denormal values
+        let small_val = 3.0e-5_f32;
+        let fp16_bits = f32_to_fp16(small_val);
+        let roundtrip = fp16_to_f32(fp16_bits);
+        assert!((roundtrip - small_val).abs() / small_val < 0.05,
+                "denormal roundtrip: {} → bits {:04x} → {}", small_val, fp16_bits, roundtrip);
     }
 
     #[test]

@@ -429,6 +429,15 @@ impl Tensor {
         }
     }
 
+    /// Borrow the underlying f32 data without copying, if the tensor is F32.
+    /// Returns None for non-F32 tensors.
+    pub fn as_f32_slice(&self) -> Option<&[f32]> {
+        match &self.data {
+            TensorData::F32(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Extract tensor data as BF16 vector.
     ///
     /// Clones BF16 data if already BF16, converts from F32 if F32.
