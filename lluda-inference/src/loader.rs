@@ -2,13 +2,19 @@
 //!
 //! Provides memory-mapped loading of model weights from SafeTensors format.
 //! The loader uses mmap to avoid loading the entire 1.5GB model file into RAM.
+//! Supports both single-file and multi-shard models (e.g., large models split
+//! into `model-00001-of-00015.safetensors`, etc.).
 //!
 //! # Example
 //!
 //! ```rust,no_run
 //! use lluda_inference::loader::ModelWeights;
 //!
+//! // Single file
 //! let weights = ModelWeights::from_safetensors("models/Qwen3-0.6B/model.safetensors")?;
+//!
+//! // Directory with one or more shards
+//! let weights = ModelWeights::from_safetensors_dir("models/Qwen3-30B/")?;
 //!
 //! // Get embedding weights
 //! let embed = weights.get("model.embed_tokens.weight").unwrap();
@@ -17,7 +23,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -173,6 +179,214 @@ impl ModelWeights {
             weights,
             mmap,
         })
+    }
+
+    /// Load model weights from a directory containing one or more SafeTensors files.
+    ///
+    /// Supports both single-file models (single `.safetensors` file in the directory)
+    /// and multi-shard models (e.g., `model-00001-of-00015.safetensors`, ...).
+    /// Files are sorted by name, which ensures correct shard ordering for all
+    /// standard naming conventions used by HuggingFace models.
+    ///
+    /// Also accepts a direct path to a single `.safetensors` file — in that case
+    /// it delegates to `from_safetensors`.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to a directory containing `.safetensors` files, or a direct
+    ///   path to a single `.safetensors` file
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Directory not found or cannot be read
+    /// - No `.safetensors` files found in the directory
+    /// - Any shard fails to load (file error, invalid format, unsupported dtype)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::loader::ModelWeights;
+    ///
+    /// // Single-file model
+    /// let weights = ModelWeights::from_safetensors_dir("models/Qwen3-0.6B/")?;
+    ///
+    /// // Multi-shard model
+    /// let weights = ModelWeights::from_safetensors_dir("models/Qwen3-30B/")?;
+    /// println!("Loaded {} tensors from shards", weights.len());
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn from_safetensors_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let shard_paths = Self::find_safetensors_files(dir)?;
+
+        if shard_paths.len() == 1 {
+            return Self::from_safetensors(&shard_paths[0]);
+        }
+
+        // Multi-shard path: load each shard and merge all tensors.
+        // load_tensor() copies data into owned Vecs, so we don't need to keep
+        // mmaps alive after loading each shard. We keep a reference to the
+        // first shard's mmap purely to satisfy the struct field requirement.
+        let mut all_weights: HashMap<String, Tensor> = HashMap::new();
+        let mut first_mmap: Option<Arc<Mmap>> = None;
+
+        for path in &shard_paths {
+            let file = std::fs::File::open(path).map_err(|e| {
+                LludaError::Msg(format!("Failed to open {}: {}", path.display(), e))
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                LludaError::Msg(format!("Failed to mmap {}: {}", path.display(), e))
+            })?;
+            let mmap = Arc::new(mmap);
+
+            let tensors = SafeTensors::deserialize(&*mmap).map_err(|e| {
+                LludaError::SafeTensors(format!(
+                    "Failed to parse SafeTensors from {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+            for (name, view) in tensors.tensors() {
+                let tensor = load_tensor(&view)?;
+                all_weights.insert(name.to_string(), tensor);
+            }
+
+            if first_mmap.is_none() {
+                first_mmap = Some(mmap);
+            }
+        }
+
+        let mmap = first_mmap
+            .expect("shard_paths is non-empty so first_mmap is always set");
+
+        Ok(Self {
+            weights: all_weights,
+            mmap,
+        })
+    }
+
+    /// Load model weights from a directory, quantizing 2D weight tensors to Q8_0.
+    ///
+    /// Loads all shards as BF16/F32 first, merges them, then quantizes all 2D
+    /// linear projection weights (attention and MLP projections) to Q8_0.
+    /// 1D tensors (norms, biases) and embeddings remain in their original format.
+    ///
+    /// Supports both single-file and multi-shard models. See [`from_safetensors_dir`]
+    /// for details on shard discovery and ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to a directory containing `.safetensors` files, or a direct
+    ///   path to a single `.safetensors` file
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Directory not found or cannot be read
+    /// - No `.safetensors` files found in the directory
+    /// - Any shard fails to load (file error, invalid format, unsupported dtype)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::loader::ModelWeights;
+    ///
+    /// let weights = ModelWeights::from_safetensors_dir_q8("models/Qwen3-30B/")?;
+    /// println!("Loaded {} tensors (2D weights quantized to Q8_0)", weights.len());
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    ///
+    /// [`from_safetensors_dir`]: ModelWeights::from_safetensors_dir
+    pub fn from_safetensors_dir_q8(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let shard_paths = Self::find_safetensors_files(dir)?;
+
+        if shard_paths.len() == 1 {
+            return Self::from_safetensors_q8(&shard_paths[0]);
+        }
+
+        // Load all shards as BF16/F32, then quantize in one pass.
+        // This is cleaner than quantizing per-shard because we process the full
+        // merged model uniformly.
+        let mut merged = Self::from_safetensors_dir(dir)?;
+        merged.quantize_2d_weights_to_q8()?;
+        Ok(merged)
+    }
+
+    /// Quantize all 2D linear projection weights in-place to Q8_0.
+    ///
+    /// Targets tensors that are 2D, have "weight" in their name, and are NOT
+    /// embedding or norm tensors — i.e., attention and MLP projection matrices.
+    fn quantize_2d_weights_to_q8(&mut self) -> Result<()> {
+        let names: Vec<String> = self.weights.keys().cloned().collect();
+
+        for name in names {
+            let shape = {
+                let tensor = self.weights.get(&name).unwrap();
+                tensor.shape().to_vec()
+            };
+
+            let is_2d_linear_weight = shape.len() == 2
+                && name.contains("weight")
+                && !name.contains("embed_tokens")
+                && !name.contains("norm");
+
+            if is_2d_linear_weight {
+                let tensor = self.weights.remove(&name).unwrap();
+                let f32_data = tensor.to_vec_f32();
+                let numel: usize = shape.iter().product();
+
+                let blocks = quantize_f32_to_q8(&f32_data);
+                let q8_tensor = Tensor::from_q8_blocks(blocks, numel, shape)?;
+                self.weights.insert(name, q8_tensor);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Discover all `.safetensors` files in a directory, sorted by name.
+    ///
+    /// If `path` is a file with the `.safetensors` extension, returns it directly.
+    /// If `path` is a directory, collects all `.safetensors` files and sorts them.
+    ///
+    /// Sorting by file name ensures correct shard order for standard HuggingFace
+    /// naming conventions: `model-00001-of-00015.safetensors`, etc.
+    fn find_safetensors_files(path: &Path) -> Result<Vec<PathBuf>> {
+        if path.is_file() {
+            if path.extension().map_or(false, |e| e == "safetensors") {
+                return Ok(vec![path.to_path_buf()]);
+            }
+            return Err(LludaError::Msg(format!(
+                "Path is a file but not a .safetensors file: {}",
+                path.display()
+            )));
+        }
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| {
+                LludaError::Msg(format!(
+                    "Failed to read directory {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|p| p.extension().map_or(false, |e| e == "safetensors"))
+            .collect();
+
+        if files.is_empty() {
+            return Err(LludaError::Msg(format!(
+                "No .safetensors files found in {}",
+                path.display()
+            )));
+        }
+
+        files.sort();
+        Ok(files)
     }
 
     /// Get a tensor by name.
