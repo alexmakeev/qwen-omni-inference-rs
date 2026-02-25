@@ -512,3 +512,209 @@ fn test_omni_all_text_scenarios() {
 
     println!("All {} scenarios passed.", results.len());
 }
+
+#[test]
+fn test_omni_q8_all_text_scenarios() {
+    if skip_if_no_model() || skip_if_no_reference() {
+        return;
+    }
+
+    use lluda_inference::config::Qwen3Config;
+    use lluda_inference::loader::ModelWeights;
+    use lluda_inference::model::Qwen3ForCausalLM;
+    use std::time::Instant;
+
+    // Check memory and disk before starting
+    println!("=== System resources before Q8 all-scenarios test ===");
+    let mem_output = std::process::Command::new("free")
+        .arg("-h")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| "(free -h failed)".to_string());
+    println!("Memory:\n{}", mem_output);
+
+    let df_output = std::process::Command::new("df")
+        .args(["-h", "/home/alexmak"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|_| "(df -h failed)".to_string());
+    println!("Disk:\n{}", df_output);
+
+    // Load config
+    let config = Qwen3Config::from_file(Path::new(MODEL_DIR).join("config.json"))
+        .expect("Failed to load Omni config");
+
+    println!(
+        "Config loaded: hidden_size={}, layers={}, heads={}, kv_heads={}, head_dim={}, prefix='{}'",
+        config.hidden_size,
+        config.num_hidden_layers,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.head_dim,
+        config.tensor_prefix
+    );
+
+    // Load Q8 weights ONCE — model loading is expensive
+    println!("Loading Q8_0 quantized weights for all-scenarios test...");
+    let load_start = Instant::now();
+    let weights = ModelWeights::from_safetensors_dir_q8(MODEL_DIR)
+        .expect("Failed to load Q8_0 model weights");
+    let load_elapsed = load_start.elapsed();
+
+    println!(
+        "Q8 weights loaded: {} tensors in {:.2}s",
+        weights.len(),
+        load_elapsed.as_secs_f64()
+    );
+
+    let mut model = Qwen3ForCausalLM::load(&config, &weights)
+        .expect("Failed to build model");
+
+    // All 6 text scenarios
+    let scenarios = [
+        "omni_text_simple",
+        "omni_text_simple_chat",
+        "omni_text_factual",
+        "omni_text_factual_chat",
+        "omni_text_russian",
+        "omni_text_russian_chat",
+    ];
+
+    struct ScenarioResult {
+        name: &'static str,
+        cos: f64,
+        rust_argmax: usize,
+        ref_argmax: usize,
+        argmax_match: bool,
+        elapsed_ms: u128,
+    }
+
+    let mut results: Vec<ScenarioResult> = Vec::new();
+
+    for scenario in &scenarios {
+        let ref_dir = Path::new(REFERENCE_DIR).join(scenario);
+
+        if !ref_dir.exists() {
+            println!("Skipping {}: reference dir not found", scenario);
+            continue;
+        }
+
+        println!("\nRunning Q8 scenario: {}", scenario);
+
+        let input_ids_i64 = load_npy_i64(&ref_dir.join("input_ids.npy"));
+        let input_ids: Vec<u32> = input_ids_i64.iter().map(|&v| v as u32).collect();
+
+        println!("  Input tokens ({} total): {:?}", input_ids.len(), input_ids);
+
+        // Reset KV cache between scenarios so each runs as a fresh forward pass at pos=0
+        model.clear_kv_cache();
+
+        let fwd_start = Instant::now();
+        let logits_tensor = model.forward(&input_ids, 0).expect("Forward pass failed");
+        let fwd_elapsed = fwd_start.elapsed();
+
+        assert_eq!(
+            logits_tensor.shape(),
+            &[1, 1, config.vocab_size],
+            "Unexpected logits shape for scenario {}",
+            scenario
+        );
+
+        let rust_logits = logits_tensor.to_vec_f32();
+
+        // Reference logits shape is [1, seq_len, vocab_size].
+        // The Rust model returns only last-token logits [1, 1, vocab_size].
+        // Extract last token from reference: take the last vocab_size elements.
+        let ref_logits_full = load_npy_f32(&ref_dir.join("logits.npy"));
+        let vocab_size = config.vocab_size;
+        assert!(
+            ref_logits_full.len() >= vocab_size && ref_logits_full.len() % vocab_size == 0,
+            "Unexpected reference logits length {} for scenario {} (vocab_size={})",
+            ref_logits_full.len(), scenario, vocab_size
+        );
+        let ref_logits = ref_logits_full[ref_logits_full.len() - vocab_size..].to_vec();
+
+        assert_eq!(
+            rust_logits.len(),
+            ref_logits.len(),
+            "Logits length mismatch for scenario {}",
+            scenario
+        );
+
+        let cos = cosine_similarity(&rust_logits, &ref_logits);
+
+        let rust_argmax = rust_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let ref_argmax = ref_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+
+        let argmax_match = rust_argmax == ref_argmax;
+
+        println!(
+            "  Cosine: {:.6}, Rust argmax: {}, Ref argmax: {}, Match: {}, Time: {}ms",
+            cos, rust_argmax, ref_argmax, argmax_match, fwd_elapsed.as_millis()
+        );
+
+        results.push(ScenarioResult {
+            name: scenario,
+            cos,
+            rust_argmax,
+            ref_argmax,
+            argmax_match,
+            elapsed_ms: fwd_elapsed.as_millis(),
+        });
+    }
+
+    // Print summary table
+    println!("\n{:-<80}", "");
+    println!(
+        "{:<30} {:>10} {:>12} {:>12} {:>7} {:>10}",
+        "Scenario", "Cosine", "Rust argmax", "Ref argmax", "Match", "Time(ms)"
+    );
+    println!("{:-<80}", "");
+    for r in &results {
+        println!(
+            "{:<30} {:>10.6} {:>12} {:>12} {:>7} {:>10}",
+            r.name, r.cos, r.rust_argmax, r.ref_argmax, r.argmax_match, r.elapsed_ms
+        );
+    }
+    println!("{:-<80}", "");
+
+    // Assert all scenarios meet Q8 quality threshold (slightly relaxed vs BF16 0.95)
+    let mut all_passed = true;
+    for r in &results {
+        let scenario_pass = r.cos > 0.90 && r.argmax_match;
+        if !scenario_pass {
+            all_passed = false;
+            eprintln!(
+                "FAIL scenario '{}': cosine={:.6} (need >0.90), argmax_match={}",
+                r.name, r.cos, r.argmax_match
+            );
+        }
+        assert!(
+            r.cos > 0.90,
+            "Scenario '{}' cosine {:.6} too low (expected > 0.90 for Q8_0 inference)",
+            r.name,
+            r.cos
+        );
+        assert!(
+            r.argmax_match,
+            "Scenario '{}' argmax mismatch: rust={}, ref={}",
+            r.name,
+            r.rust_argmax,
+            r.ref_argmax
+        );
+    }
+
+    if all_passed {
+        println!("All {} Q8 scenarios passed.", results.len());
+    }
+}
