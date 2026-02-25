@@ -1250,3 +1250,17 @@ Next:
 - Generate Q8 Python reference data for Qwen3-Omni-30B (run omni_reference.py --quantize q8)
 - End-to-end inference test (requires Omni config parser update for nested configs)
 - Future: SIMD (Phase 7), GPU Q8 (Phase 6), Q4_0 (Phase 8)
+
+## 2026-02-25 07:50
+--- COMPACTING (auto) ---
+
+## 2026-02-25 08:15
+Done: Q4_0 Phase 8 complete — validated on real Qwen2.5-Omni-3B weights (502 layers)
+- Q4 per-element: avg cos=0.995, min cos=0.989 (audio_tower fc2 wide dynamic range)
+- Q4 matmul: cos=0.977 (accumulated error across K=1280, expected for 4-bit)
+- Q8 per-element: avg cos=0.99998, min cos=0.99996
+- Q8 matmul: cos=0.99999
+- Q4 vs Q8: Q8 >= Q4 on all 502 tensors confirmed
+- All 5 real-weight tests PASSED, 31 unit tests PASSED, 361 lib tests PASSED
+- 15 commits on q8-quantization branch
+Next: Assess remaining CPU-side work (all phases without GPU done?)
