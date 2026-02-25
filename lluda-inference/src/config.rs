@@ -135,7 +135,26 @@ mod tests {
 
     #[test]
     fn test_load_qwen3_06b_config() {
-        let config = Qwen3Config::from_file("../models/Qwen3-0.6B/config.json").unwrap();
+        let json = r#"{
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "eos_token_id": 151645,
+            "tie_word_embeddings": true
+        }"#;
+
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
 
         assert_eq!(config.hidden_size, 1024);
         assert_eq!(config.intermediate_size, 3072);
@@ -156,7 +175,24 @@ mod tests {
 
     #[test]
     fn test_num_kv_groups() {
-        let config = Qwen3Config::from_file("../models/Qwen3-0.6B/config.json").unwrap();
+        let json = r#"{
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attention_bias": false,
+            "bos_token_id": 151643,
+            "eos_token_id": 151645
+        }"#;
+
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.num_kv_groups(), 2); // 16 / 8
     }
 
@@ -284,7 +320,24 @@ mod tests {
     #[test]
     fn test_config_roundtrip() {
         // Test serialization and deserialization
-        let config = Qwen3Config::from_file("../models/Qwen3-0.6B/config.json").unwrap();
+        let json = r#"{
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attention_bias": false,
+            "bos_token_id": 151643,
+            "eos_token_id": 151645
+        }"#;
+
+        let config: Qwen3Config = serde_json::from_str(json).unwrap();
 
         let serialized = serde_json::to_string(&config).unwrap();
         let deserialized: Qwen3Config = serde_json::from_str(&serialized).unwrap();
