@@ -265,7 +265,136 @@ impl Q8Linear {
     }
 }
 
-/// Unified linear layer supporting both BF16 and Q8_0 weights.
+/// Linear layer with Q4_0 quantized weights.
+///
+/// Weights are stored as Q4_0 blocks in [out_features, in_features] layout.
+/// Uses fused matmul_f32_x_quant — no dequantization during inference.
+#[derive(Debug, Clone)]
+pub struct Q4Linear {
+    /// Q4_0 quantized weight blocks, [out_features, in_features] layout
+    /// Stored as out_features rows of (in_features/32) blocks each
+    weight_blocks: Vec<crate::quant::Q4Block>,
+    out_features: usize,
+    in_features: usize,
+}
+
+impl Q4Linear {
+    /// Create from raw Q4_0 blocks.
+    ///
+    /// `blocks` must contain `out_features * ceil(in_features / 32)` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if the number of blocks doesn't match the expected count.
+    pub fn from_blocks(
+        blocks: Vec<crate::quant::Q4Block>,
+        out_features: usize,
+        in_features: usize,
+    ) -> crate::error::Result<Self> {
+        if in_features % 32 != 0 {
+            return Err(crate::error::LludaError::Msg(
+                format!("Q4Linear: in_features ({}) must be a multiple of 32 for Q4_0 block alignment",
+                        in_features)
+            ));
+        }
+        let blocks_per_row = in_features / 32;
+        let expected_blocks = out_features * blocks_per_row;
+        if blocks.len() != expected_blocks {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![expected_blocks],
+                got: vec![blocks.len()],
+            });
+        }
+        Ok(Self {
+            weight_blocks: blocks,
+            out_features,
+            in_features,
+        })
+    }
+
+    /// Create from a Tensor with Q4_0 dtype.
+    ///
+    /// The tensor must be 2D with shape [out_features, in_features].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if tensor is not 2D.
+    /// Returns `DTypeMismatch` if tensor dtype is not Q4_0.
+    pub fn new(weight: crate::tensor::Tensor) -> crate::error::Result<Self> {
+        use crate::tensor::DType;
+        if weight.ndim() != 2 {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![0, 0],
+                got: weight.shape().to_vec(),
+            });
+        }
+        if weight.dtype() != DType::Q4_0 {
+            return Err(crate::error::LludaError::DTypeMismatch {
+                expected: "Q4_0".to_string(),
+                got: weight.dtype().to_string(),
+            });
+        }
+        let out_features = weight.shape()[0];
+        let in_features = weight.shape()[1];
+        let blocks = weight.into_q4_blocks()?;
+        Self::from_blocks(blocks, out_features, in_features)
+    }
+
+    /// Forward pass: x[..., in_features] -> out[..., out_features]
+    ///
+    /// Accepts any tensor with last dimension equal to `in_features`.
+    /// Leading dimensions are treated as a batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if the input is empty or if the last dimension
+    /// doesn't match `in_features`.
+    pub fn forward(&self, x: &crate::tensor::Tensor) -> crate::error::Result<crate::tensor::Tensor> {
+        let x_shape = x.shape().to_vec();
+        let last_dim = *x_shape.last().ok_or_else(|| {
+            crate::error::LludaError::ShapeMismatch {
+                expected: vec![self.in_features],
+                got: vec![],
+            }
+        })?;
+
+        if last_dim != self.in_features {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![self.in_features],
+                got: vec![last_dim],
+            });
+        }
+
+        // Flatten to 2D: [batch, in_features]
+        let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
+        // Zero-copy for F32 tensors (common case — activations are always F32)
+        let x_owned;
+        let x_data: &[f32] = match x.as_f32_slice() {
+            Some(slice) => slice,
+            None => {
+                x_owned = x.to_vec_f32();
+                &x_owned
+            }
+        };
+
+        // Fused Q4 matmul: [batch, K] x [N, K/32 blocks] -> [batch, N]
+        let out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q4Block>(
+            x_data,
+            &self.weight_blocks,
+            batch,
+            self.in_features,
+            self.out_features,
+        );
+
+        // Reshape output to [..., out_features]
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(self.out_features);
+
+        crate::tensor::Tensor::new(out_data, out_shape)
+    }
+}
+
+/// Unified linear layer supporting BF16, Q8_0, and Q4_0 weights.
 /// Dispatches to the appropriate implementation at runtime.
 #[derive(Debug, Clone)]
 pub enum AnyLinear {
@@ -273,6 +402,8 @@ pub enum AnyLinear {
     F32(Linear),
     /// Q8_0 quantized weights via Q8Linear
     Q8(Q8Linear),
+    /// Q4_0 quantized weights via Q4Linear
+    Q4(Q4Linear),
 }
 
 impl AnyLinear {
@@ -281,6 +412,7 @@ impl AnyLinear {
         match self {
             AnyLinear::F32(linear) => linear.forward(x),
             AnyLinear::Q8(q8linear) => q8linear.forward(x),
+            AnyLinear::Q4(q4linear) => q4linear.forward(x),
         }
     }
 
@@ -292,6 +424,7 @@ impl AnyLinear {
                 [s[0], s[1]]
             }
             AnyLinear::Q8(q8linear) => [q8linear.out_features, q8linear.in_features],
+            AnyLinear::Q4(q4linear) => [q4linear.out_features, q4linear.in_features],
         }
     }
 }

@@ -31,7 +31,7 @@ use safetensors::SafeTensors;
 
 use crate::bf16::BF16;
 use crate::error::{LludaError, Result};
-use crate::quant::quantize_f32_to_q8;
+use crate::quant::{quantize_f32_to_q4, quantize_f32_to_q8};
 use crate::tensor::Tensor;
 
 /// Container for model weights loaded from SafeTensors format.
@@ -344,7 +344,99 @@ impl ModelWeights {
         Ok(())
     }
 
-/// Discover all `.safetensors` files in a directory, sorted by name.
+    /// Load model weights from a SafeTensors file, quantizing 2D weight tensors to Q4_0.
+    ///
+    /// Same as `from_safetensors_q8` but uses Q4_0 (4-bit) quantization instead of Q8_0.
+    /// Q4_0 uses ~50% the memory of Q8_0 at some cost to accuracy.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the .safetensors file
+    pub fn from_safetensors_q4(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| LludaError::SafeTensors(format!("Failed to parse SafeTensors: {}", e)))?;
+
+        let mut weights = HashMap::new();
+
+        for (name, view) in tensors.tensors() {
+            let shape = view.shape().to_vec();
+
+            if is_quantizable_weight(&name, &shape) {
+                let tensor = load_tensor(&view)?;
+                let f32_data = tensor.to_vec_f32();
+                let numel = shape.iter().product::<usize>();
+
+                let blocks = quantize_f32_to_q4(&f32_data);
+                let q4_tensor = Tensor::from_q4_blocks(blocks, numel, shape)?;
+                weights.insert(name.to_string(), q4_tensor);
+            } else {
+                let tensor = load_tensor(&view)?;
+                weights.insert(name.to_string(), tensor);
+            }
+        }
+
+        Ok(Self {
+            weights,
+            mmap,
+        })
+    }
+
+    /// Load model weights from a directory, quantizing 2D weight tensors to Q4_0.
+    ///
+    /// Same as `from_safetensors_dir_q8` but uses Q4_0 (4-bit) quantization.
+    /// Supports both single-file and multi-shard models.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to a directory containing `.safetensors` files, or a direct
+    ///   path to a single `.safetensors` file
+    pub fn from_safetensors_dir_q4(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let shard_paths = Self::find_safetensors_files(dir)?;
+
+        if shard_paths.len() == 1 {
+            return Self::from_safetensors_q4(&shard_paths[0]);
+        }
+
+        let mut merged = Self::from_safetensors_dir(dir)?;
+        merged.quantize_2d_weights_to_q4()?;
+        Ok(merged)
+    }
+
+    /// Quantize all 2D linear projection weights in-place to Q4_0.
+    ///
+    /// Targets tensors that are 2D, have "weight" in their name, and are NOT
+    /// embedding or norm tensors — i.e., attention and MLP projection matrices.
+    fn quantize_2d_weights_to_q4(&mut self) -> Result<()> {
+        let names: Vec<String> = self.weights.keys().cloned().collect();
+
+        for name in names {
+            let shape = {
+                let tensor = self.weights.get(&name).unwrap();
+                tensor.shape().to_vec()
+            };
+
+            if is_quantizable_weight(&name, &shape) {
+                let tensor = self.weights.remove(&name).unwrap();
+                let f32_data = tensor.to_vec_f32();
+                let numel: usize = shape.iter().product();
+
+                let blocks = quantize_f32_to_q4(&f32_data);
+                let q4_tensor = Tensor::from_q4_blocks(blocks, numel, shape)?;
+                self.weights.insert(name, q4_tensor);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Discover all `.safetensors` files in a directory, sorted by name.
     ///
     /// If `path` is a file with the `.safetensors` extension, returns it directly.
     /// If `path` is a directory, collects all `.safetensors` files and sorts them.

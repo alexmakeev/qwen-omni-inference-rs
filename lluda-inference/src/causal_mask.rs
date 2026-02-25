@@ -163,6 +163,11 @@ pub fn causal_mask(
                 "causal_mask does not support Q8_0 dtype — use F32 or BF16".to_string(),
             ));
         }
+        DType::Q4_0 => {
+            return Err(crate::error::LludaError::Msg(
+                "causal_mask does not support Q4_0 dtype — use F32 or BF16".to_string(),
+            ));
+        }
     };
 
     Ok(Some(mask))

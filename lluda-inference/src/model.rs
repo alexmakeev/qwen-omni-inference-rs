@@ -47,7 +47,7 @@
 
 use std::sync::Arc;
 
-use crate::attention::{AnyLinear, Attention, KvCache, Linear, Q8Linear};
+use crate::attention::{AnyLinear, Attention, KvCache, Linear, Q4Linear, Q8Linear};
 use crate::causal_mask::causal_mask;
 use crate::config::Qwen3Config;
 use crate::embedding::Embedding;
@@ -464,11 +464,13 @@ impl Qwen3ForCausalLM {
 
 /// Create the appropriate AnyLinear variant for a weight tensor.
 ///
-/// Q8_0 tensors become Q8Linear; all other dtypes become Linear (BF16/F32).
-/// This allows the same loader to handle both quantized and non-quantized models.
+/// Q8_0 tensors become Q8Linear; Q4_0 tensors become Q4Linear;
+/// all other dtypes become Linear (BF16/F32).
+/// This allows the same loader to handle quantized and non-quantized models.
 fn make_linear(weight: Tensor) -> Result<AnyLinear> {
     match weight.dtype() {
         DType::Q8_0 => Ok(AnyLinear::Q8(Q8Linear::new(weight)?)),
+        DType::Q4_0 => Ok(AnyLinear::Q4(Q4Linear::new(weight)?)),
         _ => Ok(AnyLinear::F32(Linear::new(weight)?)),
     }
 }
