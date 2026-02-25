@@ -1571,4 +1571,187 @@ mod tests {
             cos_sim
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Q4_0 integration tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Test: F32 tensor roundtrip through Q4_0 ───────────────────────────────
+
+    #[test]
+    fn test_tensor_f32_to_q4_roundtrip() {
+        use crate::tensor::{DType, Tensor};
+
+        // [2, 32] F32 tensor — 64 values total (2 full Q4_0 blocks).
+        let data: Vec<f32> = (0..64)
+            .map(|i| (i as f32 * 0.17).sin() * 0.8)
+            .collect();
+        let original = Tensor::new(data.clone(), vec![2, 32]).unwrap();
+
+        // Convert F32 -> Q4_0 -> F32.
+        let q4_tensor = original.to_dtype(DType::Q4_0).unwrap();
+        assert_eq!(q4_tensor.dtype(), DType::Q4_0,
+            "After to_dtype(Q4_0), dtype should be Q4_0");
+        assert_eq!(q4_tensor.shape(), &[2, 32],
+            "Shape should be preserved after quantization");
+
+        let recovered = q4_tensor.to_dtype(DType::F32).unwrap();
+        assert_eq!(recovered.dtype(), DType::F32,
+            "After to_dtype(F32), dtype should be F32");
+
+        let recovered_data = recovered.to_vec_f32();
+        assert_eq!(recovered_data.len(), data.len(),
+            "Recovered tensor should have same number of elements");
+
+        // Compute MSE — Q4 is 4-bit so tolerance is wider than Q8.
+        let mse: f64 = data.iter().zip(recovered_data.iter())
+            .map(|(&a, &b)| { let d = a as f64 - b as f64; d * d })
+            .sum::<f64>()
+            / data.len() as f64;
+
+        assert!(
+            mse < 0.05,
+            "F32->Q4_0->F32 roundtrip MSE {:.4e} exceeds 0.05 (Q4 wider tolerance)",
+            mse
+        );
+
+        // Cosine similarity should still be high.
+        let cos = cosine_similarity(&data, &recovered_data);
+        assert!(
+            cos > 0.99,
+            "F32->Q4_0->F32 roundtrip cosine {:.6} < 0.99",
+            cos
+        );
+    }
+
+    // ── Test: Q4Linear forward vs F32 Linear ─────────────────────────────────
+
+    #[test]
+    fn test_q4linear_forward_vs_linear() {
+        use crate::attention::{Linear, Q4Linear};
+        use crate::tensor::Tensor;
+
+        let out_features = 64usize;
+        let in_features = 32usize;
+
+        // Deterministic weights [64, 32].
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| (i as f32 * 0.13).sin() * 0.6)
+            .collect();
+
+        // F32 reference linear layer.
+        let w_tensor_f32 = Tensor::new(w_f32.clone(), vec![out_features, in_features]).unwrap();
+        let linear_f32 = Linear::new(w_tensor_f32).unwrap();
+
+        // Q4Linear from quantized blocks.
+        let q4_blocks = quantize_f32_to_q4(&w_f32);
+        let q4lin = Q4Linear::from_blocks(q4_blocks, out_features, in_features).unwrap();
+
+        // Input: [1, 32].
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| (i as f32 * 0.11 + 0.1).cos() * 0.9)
+            .collect();
+        let x = Tensor::new(x_data, vec![1, in_features]).unwrap();
+
+        let out_f32 = linear_f32.forward(&x).unwrap().to_vec_f32();
+        let out_q4 = q4lin.forward(&x).unwrap().to_vec_f32();
+
+        assert_eq!(out_f32.len(), out_features,
+            "F32 output length should be {}, got {}", out_features, out_f32.len());
+        assert_eq!(out_q4.len(), out_features,
+            "Q4 output length should be {}, got {}", out_features, out_q4.len());
+
+        // Q4 has less precision than Q8, so threshold is 0.99 instead of 0.999.
+        let cos = cosine_similarity(&out_f32, &out_q4);
+        assert!(
+            cos > 0.99,
+            "Q4Linear vs F32 Linear cosine {:.6} < 0.99 — Q4 output diverged too much",
+            cos
+        );
+    }
+
+    // ── Test: Q4Linear batched forward (2D and 3D input) ─────────────────────
+
+    #[test]
+    fn test_q4linear_batched() {
+        use crate::attention::Q4Linear;
+        use crate::tensor::Tensor;
+
+        let out_features = 32usize;
+        let in_features = 64usize;
+
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| (i as f32 * 0.05).sin() * 0.4)
+            .collect();
+        let q4_blocks = quantize_f32_to_q4(&w_f32);
+        let q4lin = Q4Linear::from_blocks(q4_blocks, out_features, in_features).unwrap();
+
+        // 2D batch: [4, 64] → [4, 32].
+        let x_2d_data: Vec<f32> = (0..4 * in_features)
+            .map(|i| (i as f32 * 0.03 + 0.2).cos())
+            .collect();
+        let x_2d = Tensor::new(x_2d_data, vec![4, in_features]).unwrap();
+        let out_2d = q4lin.forward(&x_2d).unwrap();
+        assert_eq!(
+            out_2d.shape(), &[4, out_features],
+            "2D batched Q4Linear output shape should be [4, {}], got {:?}",
+            out_features, out_2d.shape()
+        );
+
+        // 3D batch: [2, 3, 64] → [2, 3, 32].
+        let x_3d_data: Vec<f32> = (0..2 * 3 * in_features)
+            .map(|i| (i as f32 * 0.04 + 0.1).sin())
+            .collect();
+        let x_3d = Tensor::new(x_3d_data, vec![2, 3, in_features]).unwrap();
+        let out_3d = q4lin.forward(&x_3d).unwrap();
+        assert_eq!(
+            out_3d.shape(), &[2, 3, out_features],
+            "3D batched Q4Linear output shape should be [2, 3, {}], got {:?}",
+            out_features, out_3d.shape()
+        );
+    }
+
+    // ── Test: AnyLinear::Q4 dispatch ─────────────────────────────────────────
+
+    #[test]
+    fn test_anylinear_q4_dispatch() {
+        use crate::attention::{AnyLinear, Q4Linear};
+        use crate::tensor::Tensor;
+
+        let out_features = 32usize;
+        let in_features = 64usize;
+
+        // Build Q4Linear and wrap in AnyLinear::Q4.
+        let w_f32: Vec<f32> = (0..out_features * in_features)
+            .map(|i| (i as f32 * 0.09).sin() * 0.5)
+            .collect();
+        let q4_blocks = quantize_f32_to_q4(&w_f32);
+        let q4lin = Q4Linear::from_blocks(q4_blocks, out_features, in_features).unwrap();
+        let any_q4 = AnyLinear::Q4(q4lin);
+
+        // Input: [1, 64].
+        let x_data: Vec<f32> = (0..in_features)
+            .map(|i| (i as f32 * 0.11 + 0.1).cos() * 0.8)
+            .collect();
+        let x = Tensor::new(x_data, vec![1, in_features]).unwrap();
+
+        // forward() should succeed and return [1, 32] tensor.
+        let out = any_q4.forward(&x).unwrap();
+        let out_shape = out.shape().to_vec();
+        assert_eq!(
+            out_shape, vec![1, out_features],
+            "AnyLinear::Q4 forward should produce [1, {}], got {:?}",
+            out_features, out_shape
+        );
+
+        // Output should contain finite values (not NaN/Inf).
+        let out_data = out.to_vec_f32();
+        for (i, &v) in out_data.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "AnyLinear::Q4 output[{}] is non-finite: {}",
+                i, v
+            );
+        }
+    }
 }
