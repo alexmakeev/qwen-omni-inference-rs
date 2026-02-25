@@ -221,6 +221,65 @@ def quantize_model_q8(model):
     return quality_report
 
 
+def quantize_model_q4(model):
+    """Quantize all 2D weight tensors to Q4_0 precision.
+
+    Q4_0 format: scale = max(|block|) / 8, q[i] = round(val[i] / scale) + 8
+    Block size: 32 values. Values stored as unsigned 4-bit [0..15].
+    Effective signed range: [-8, 7] * scale.
+    """
+    import numpy as np
+    quality_report = {}
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.ndim != 2:
+                continue
+            if 'embed_tokens' in name or 'norm' in name:
+                continue
+
+            original = param.data.float()
+            flat = original.reshape(-1)
+
+            n = flat.numel()
+            padded_n = ((n + 31) // 32) * 32
+            padded = torch.zeros(padded_n, dtype=torch.float32, device=flat.device)
+            padded[:n] = flat
+
+            blocks = padded.reshape(-1, 32)
+            scales = blocks.abs().max(dim=1).values / 8.0
+            scales = scales.clamp(min=1e-10)
+
+            inv_scales = 1.0 / scales
+            # Quantize to unsigned 4-bit [0, 15] with offset 8
+            quants = (blocks * inv_scales.unsqueeze(1)).round() + 8
+            quants = quants.clamp(0, 15).floor()
+
+            # Dequantize: (q - 8) * scale
+            dequantized = (quants - 8) * scales.unsqueeze(1)
+
+            dequantized_flat = dequantized.reshape(-1)[:n]
+            dequantized_weight = dequantized_flat.reshape(original.shape)
+
+            mse = ((original - dequantized_weight) ** 2).mean().item()
+            cos_sim = torch.nn.functional.cosine_similarity(
+                original.reshape(1, -1), dequantized_weight.reshape(1, -1)
+            ).item()
+            max_diff = (original - dequantized_weight).abs().max().item()
+
+            quality_report[name] = {
+                'mse': mse,
+                'cosine_similarity': cos_sim,
+                'max_abs_diff': max_diff,
+                'scale_min': scales.min().item(),
+                'scale_max': scales.max().item(),
+            }
+
+            param.data.copy_(dequantized_weight.to(param.dtype))
+
+    return quality_report
+
+
 def save_npy(save_dir: Path, name: str, tensor: np.ndarray):
     """Save a numpy array as .npy file, logging shape and size."""
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -2516,7 +2575,13 @@ def _apply_quantization(model, args, output_dir: Path):
         print(f"QUANTIZING MODEL TO Q8_0")
         print(f"{'='*60}")
         quality_report = quantize_model_q8(model)
+    elif args.quantize == "q4":
+        print(f"\n{'='*60}")
+        print(f"QUANTIZING MODEL TO Q4_0")
+        print(f"{'='*60}")
+        quality_report = quantize_model_q4(model)
 
+    if args.quantize in ("q8", "q4"):
         # Print summary
         mses = [v["mse"] for v in quality_report.values()]
         cos_sims = [v["cosine_similarity"] for v in quality_report.values()]
@@ -2526,7 +2591,7 @@ def _apply_quantization(model, args, output_dir: Path):
 
         # Save quality report
         output_dir.mkdir(parents=True, exist_ok=True)
-        report_path = output_dir / "q8_quality_report.json"
+        report_path = os.path.join(output_dir, f'{args.quantize}_quality_report.json')
         with open(report_path, "w") as f:
             json.dump(quality_report, f, indent=2)
         print(f"Quality report saved to {report_path}")
