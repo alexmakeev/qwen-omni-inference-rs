@@ -89,6 +89,24 @@ pub struct Q8Block {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Q4Block struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Q4_0 quantized block: 32 values in 18 bytes.
+/// Format: 2-byte FP16 scale + 16 bytes of packed 4-bit unsigned nibbles.
+/// Each nibble stores round(value/scale) + 8, so effective signed range is [-8, 7].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Q4Block {
+    /// FP16 scale factor (IEEE 754 half-precision)
+    pub scale_bits: u16,
+    /// Packed nibbles: each byte holds 2 values
+    /// byte[i] low nibble (bits 0-3) = quant[2*i]
+    /// byte[i] high nibble (bits 4-7) = quant[2*i+1]
+    pub nibs: [u8; 16],
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FP16 helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -311,6 +329,90 @@ impl QuantBlock for Q8Block {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// QuantBlock implementation for Q4Block
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl QuantBlock for Q4Block {
+    const BLOCK_VALUES: usize = 32;
+    const BLOCK_BYTES: usize = 18;
+    const DTYPE_NAME: &'static str = "Q4_0";
+
+    /// Quantize 32 f32 values into a Q4_0 block.
+    ///
+    /// The scale is derived from the absolute maximum value in the block:
+    /// `scale = max(|values[i]|) / 8.0`
+    ///
+    /// Values are offset by 8 before packing so they fit in [0, 15]:
+    /// `nibble = round(value / scale) + 8`, clamped to [0, 15]
+    fn quantize(values: &[f32; 32]) -> Self {
+        let abs_max = values
+            .iter()
+            .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+
+        if abs_max == 0.0 {
+            // All zeros: nibbles = 0x88 (both nibbles = 8 = zero offset), scale = 0.
+            return Q4Block {
+                scale_bits: 0,
+                nibs: [0x88u8; 16],
+            };
+        }
+
+        let scale = abs_max / 8.0;
+        let inv_scale = 1.0 / scale;
+
+        let mut nibs = [0u8; 16];
+        for i in 0..16 {
+            let q0 = ((values[2 * i] * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+            let q1 = ((values[2 * i + 1] * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+            nibs[i] = q0 | (q1 << 4);
+        }
+
+        Q4Block {
+            scale_bits: f32_to_fp16(scale),
+            nibs,
+        }
+    }
+
+    /// Return the FP16 scale as f32.
+    fn scale(&self) -> f32 {
+        fp16_to_f32(self.scale_bits)
+    }
+
+    /// Fused dot product without intermediate dequantization.
+    ///
+    /// Computes `sum((nibble[i] - 8) * activations[i]) * scale` directly.
+    /// No temporary f32 weight array is created — the compiler can vectorize this loop.
+    fn block_dot_f32(&self, activations: &[f32; 32]) -> f32 {
+        let s = self.scale();
+        let mut acc = 0.0f32;
+        for i in 0..16 {
+            let byte = self.nibs[i];
+            let q0 = (byte & 0x0F) as i32 - 8; // signed: [-8, 7]
+            let q1 = ((byte >> 4) & 0x0F) as i32 - 8;
+            acc += q0 as f32 * activations[2 * i];
+            acc += q1 as f32 * activations[2 * i + 1];
+        }
+        acc * s
+    }
+
+    /// Dequantize block to f32 values.
+    /// Used for dtype conversion (Q4→F32) and testing.
+    /// Inference should use `block_dot_f32` for fused computation.
+    fn dequantize(&self) -> [f32; 32] {
+        let s = self.scale();
+        let mut out = [0.0f32; 32];
+        for i in 0..16 {
+            let byte = self.nibs[i];
+            let q0 = (byte & 0x0F) as i32 - 8;
+            let q1 = ((byte >> 4) & 0x0F) as i32 - 8;
+            out[2 * i] = q0 as f32 * s;
+            out[2 * i + 1] = q1 as f32 * s;
+        }
+        out
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Batch quantization helper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -340,6 +442,34 @@ pub fn quantize_f32_to_q8(values: &[f32]) -> Vec<Q8Block> {
         blocks.push(Q8Block::quantize(&block_vals));
     }
 
+    blocks
+}
+
+/// Quantize a flat f32 slice to Q4_0 blocks.
+///
+/// If the slice length is not a multiple of 32, the last block is zero-padded.
+///
+/// # Example
+///
+/// ```rust
+/// use lluda_inference::quant::quantize_f32_to_q4;
+///
+/// let values: Vec<f32> = (0..48).map(|i| i as f32 * 0.01).collect();
+/// let blocks = quantize_f32_to_q4(&values);
+/// assert_eq!(blocks.len(), 2); // ceil(48 / 32) = 2 blocks
+/// ```
+pub fn quantize_f32_to_q4(values: &[f32]) -> Vec<Q4Block> {
+    let block_size = Q4Block::BLOCK_VALUES;
+    let n_blocks = (values.len() + block_size - 1) / block_size;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for b in 0..n_blocks {
+        let start = b * block_size;
+        let end = (start + block_size).min(values.len());
+        let mut block_vals = [0.0f32; 32];
+        block_vals[..end - start].copy_from_slice(&values[start..end]);
+        // Remaining positions (if any) stay as 0.0 — the zero-padding.
+        blocks.push(Q4Block::quantize(&block_vals));
+    }
     blocks
 }
 
@@ -1116,6 +1246,275 @@ mod tests {
         assert_eq!(
             out_3d.shape(), &[2, 3, 32],
             "3D batched output shape should be [2, 3, 32], got {:?}", out_3d.shape()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Q4_0 unit tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_q4_block_quantize_basic() {
+        // Quantize known values and verify dequantized values are reasonable.
+        // Q4 has only 16 levels so tolerance is wider than Q8.
+        let mut values = [0.0f32; 32];
+        // Set first 4 known values; rest zero.
+        values[0] = -1.0;
+        values[1] = 0.5;
+        values[2] = 0.0;
+        values[3] = 1.0;
+
+        let block = Q4Block::quantize(&values);
+
+        // Scale should be positive (abs_max = 1.0, scale = 1.0/8.0 = 0.125).
+        let scale = block.scale();
+        assert!(scale > 0.0, "Scale should be positive, got {}", scale);
+
+        let deq = block.dequantize();
+
+        // -1.0: nibble = round(-1.0/0.125) + 8 = round(-8) + 8 = 0 → deq = (0-8)*0.125 = -1.0
+        let err0 = (deq[0] - (-1.0f32)).abs();
+        assert!(err0 < 0.2, "deq[0]={} expected ~-1.0, error {}", deq[0], err0);
+
+        // 0.5: nibble = round(0.5/0.125) + 8 = 4 + 8 = 12 → deq = (12-8)*0.125 = 0.5
+        let err1 = (deq[1] - 0.5f32).abs();
+        assert!(err1 < 0.2, "deq[1]={} expected ~0.5, error {}", deq[1], err1);
+
+        // 0.0: nibble = 8 → deq = 0.0
+        let err2 = deq[2].abs();
+        assert!(err2 < 0.2, "deq[2]={} expected ~0.0, error {}", deq[2], err2);
+
+        // 1.0: nibble = round(1.0/0.125) + 8 = 8 + 8 = 16 → clamped to 15 → deq = 7*0.125 = 0.875
+        // (max positive is 7 due to asymmetry)
+        let err3 = (deq[3] - 1.0f32).abs();
+        assert!(err3 < 0.2, "deq[3]={} expected ~1.0, error {}", deq[3], err3);
+    }
+
+    #[test]
+    fn test_q4_block_zero() {
+        let values = [0.0f32; 32];
+        let block = Q4Block::quantize(&values);
+
+        assert_eq!(block.scale_bits, 0, "Scale bits should be 0 for all-zero input");
+        assert_eq!(block.scale(), 0.0f32, "Scale should be 0.0 for all-zero input");
+
+        // All nibbles should be 0x88: low nibble = 8, high nibble = 8 (zero offset).
+        for (i, &nib) in block.nibs.iter().enumerate() {
+            assert_eq!(
+                nib, 0x88,
+                "nibs[{}] should be 0x88 for all-zero input, got 0x{:02X}",
+                i, nib
+            );
+        }
+    }
+
+    #[test]
+    fn test_q4_block_roundtrip_quality() {
+        // sin(i) pattern: values in [-1, 1].
+        let mut values = [0.0f32; 32];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = (i as f32).sin();
+        }
+
+        let block = Q4Block::quantize(&values);
+        let deq = block.dequantize();
+
+        // Compute mean squared error.
+        let mse: f32 = values
+            .iter()
+            .zip(deq.iter())
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f32>()
+            / 32.0;
+
+        // Q4 is much coarser than Q8 but MSE should still be reasonable for [-1, 1] values.
+        assert!(
+            mse < 0.01,
+            "Q4 MSE {} exceeds 0.01 for sin(i) roundtrip",
+            mse
+        );
+    }
+
+    #[test]
+    fn test_q4_block_dot_f32() {
+        // Create a block from known values and verify fused dot matches dequantize+dot.
+        let mut weights = [0.0f32; 32];
+        let mut activations = [0.0f32; 32];
+        for i in 0..32 {
+            weights[i] = (i as f32 + 1.0) / 32.0; // 1/32, 2/32, ..., 1.0
+            activations[i] = 1.0 / (i as f32 + 1.0); // 1, 1/2, 1/3, ...
+        }
+
+        let block = Q4Block::quantize(&weights);
+
+        // Reference dot product using dequantized weights.
+        let deq = block.dequantize();
+        let ref_dot: f32 = deq.iter().zip(activations.iter()).map(|(&w, &a)| w * a).sum();
+
+        let fused_dot = block.block_dot_f32(&activations);
+
+        // Q4 is coarser — use wider tolerance (~5%).
+        let err = rel_error(ref_dot, fused_dot);
+        assert!(
+            err < 0.001,
+            "Q4 block_dot_f32 {} vs reference {}, relative error {} > 0.1%",
+            fused_dot, ref_dot, err
+        );
+    }
+
+    #[test]
+    fn test_q4_nibble_packing() {
+        // Manually verify nibble packing for a known block.
+        // Use values where we can predict the nibble content.
+        // abs_max = 0.5, scale = 0.5/8 = 0.0625
+        // values[0] = -0.5 → nibble = round(-0.5/0.0625) + 8 = -8 + 8 = 0 → low nibble = 0
+        // values[1] =  0.5 → nibble = round(0.5/0.0625)  + 8 =  8 + 8 = 16 clamped to 15 → high nibble = 0xF
+        // values[2] =  0.0 → nibble = 8 → low nibble = 8
+        // values[3] = -0.25 → nibble = round(-0.25/0.0625) + 8 = -4 + 8 = 4 → high nibble = 4
+        let mut values = [0.0f32; 32];
+        values[0] = -0.5;
+        values[1] = 0.5;
+        values[2] = 0.0;
+        values[3] = -0.25;
+
+        let block = Q4Block::quantize(&values);
+
+        // Verify nibs[0]: low nibble = q0, high nibble = q1
+        let nib0_lo = block.nibs[0] & 0x0F;
+        let nib0_hi = (block.nibs[0] >> 4) & 0x0F;
+
+        // q0 for values[0] = -0.5: nibble = 0
+        assert_eq!(nib0_lo, 0, "nibs[0] low nibble should be 0, got {}", nib0_lo);
+        // q1 for values[1] = 0.5: nibble = 15 (clamped from 16)
+        assert_eq!(nib0_hi, 15, "nibs[0] high nibble should be 15, got {}", nib0_hi);
+
+        // Verify nibs[1]: low nibble = q2, high nibble = q3
+        let nib1_lo = block.nibs[1] & 0x0F;
+        let nib1_hi = (block.nibs[1] >> 4) & 0x0F;
+
+        // q2 for values[2] = 0.0: nibble = 8
+        assert_eq!(nib1_lo, 8, "nibs[1] low nibble should be 8, got {}", nib1_lo);
+        // q3 for values[3] = -0.25: nibble = round(-0.25/0.0625) + 8 = -4 + 8 = 4
+        assert_eq!(nib1_hi, 4, "nibs[1] high nibble should be 4, got {}", nib1_hi);
+    }
+
+    #[test]
+    fn test_quantize_f32_to_q4_padding() {
+        // 48 values → 2 blocks, last 16 values of second block padded with 0.
+        let values: Vec<f32> = (0..48).map(|i| i as f32 * 0.01 + 0.1).collect();
+        let blocks = quantize_f32_to_q4(&values);
+
+        assert_eq!(blocks.len(), 2,
+            "48 values should produce 2 blocks, got {}", blocks.len());
+
+        // Dequantize the second block and verify the last 16 values are ~0 (zero-padded input).
+        let deq1 = blocks[1].dequantize();
+        for i in 16..32 {
+            // Padded positions were 0.0 in input, so dequantized should be 0.0 (nibble = 8 → (8-8)*s = 0).
+            assert_eq!(
+                deq1[i], 0.0f32,
+                "Second block deq[{}] should be 0.0 (padding), got {}",
+                i, deq1[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_f32_x_q4_simple() {
+        // 2×64 activations @ 3×64 weight matrix → [2, 3] output.
+        let m = 2usize;
+        let k = 64usize;
+        let n = 3usize;
+
+        let w_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.7 + 1.0) % 2.0) - 1.0)
+            .collect();
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.3 + 0.5) % 1.5) - 0.75)
+            .collect();
+
+        // Quantize weights to Q4.
+        let w_blocks = quantize_f32_to_q4(&w_f32);
+
+        // Compute output with quantized matmul.
+        let out_quant = matmul_f32_x_quant::<Q4Block>(&x, &w_blocks, m, k, n);
+
+        // Reference: dequantize Q4 weights and compute exact f32 matmul.
+        let mut w_deq = vec![0.0f32; n * k];
+        for (b_idx, block) in w_blocks.iter().enumerate() {
+            let deq = block.dequantize();
+            let start = b_idx * 32;
+            w_deq[start..start + 32].copy_from_slice(&deq);
+        }
+        let out_ref = ref_matmul_f32(&x, &w_deq, m, k, n);
+
+        // Cosine similarity should be > 0.995 for Q4.
+        let cos_sim = cosine_similarity(&out_ref, &out_quant);
+        assert!(
+            cos_sim > 0.995,
+            "Q4 matmul cosine similarity {} < 0.995",
+            cos_sim
+        );
+    }
+
+    #[test]
+    fn test_q4_vs_q8_quality() {
+        // Quantize same data to both Q4 and Q8, verify Q8 is more accurate.
+        let mut values = [0.0f32; 32];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = (i as f32 * 0.2).sin();
+        }
+
+        let q4_block = Q4Block::quantize(&values);
+        let q8_block = Q8Block::quantize(&values);
+
+        let q4_deq = q4_block.dequantize();
+        let q8_deq = q8_block.dequantize();
+
+        let q4_mse: f32 = values
+            .iter()
+            .zip(q4_deq.iter())
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f32>()
+            / 32.0;
+
+        let q8_mse: f32 = values
+            .iter()
+            .zip(q8_deq.iter())
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f32>()
+            / 32.0;
+
+        // Q4 should have higher MSE than Q8 (coarser quantization).
+        assert!(
+            q4_mse > q8_mse,
+            "Q4 MSE {} should be > Q8 MSE {} (Q4 is coarser)",
+            q4_mse, q8_mse
+        );
+
+        // Q4 MSE should still be reasonable.
+        assert!(
+            q4_mse < 0.01,
+            "Q4 MSE {} exceeds 0.01 (too lossy)",
+            q4_mse
+        );
+
+        // Cosine similarity comparisons.
+        let q4_cos = cosine_similarity(&values, &q4_deq);
+        let q8_cos = cosine_similarity(&values, &q8_deq);
+
+        // Q4 cosine should be lower than Q8 cosine.
+        assert!(
+            q4_cos < q8_cos,
+            "Q4 cosine {} should be < Q8 cosine {} (Q4 is coarser)",
+            q4_cos, q8_cos
+        );
+
+        // But Q4 cosine should still be high.
+        assert!(
+            q4_cos > 0.99,
+            "Q4 cosine similarity {} < 0.99 (too lossy)",
+            q4_cos
         );
     }
 
