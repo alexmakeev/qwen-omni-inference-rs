@@ -296,8 +296,15 @@ impl Qwen3ForCausalLM {
         };
 
         // Pre-transpose LM head weight: [vocab_size, hidden_size] -> [hidden_size, vocab_size]
-        // This is expensive but we only do it once during model loading
-        let lm_head_weight_transposed = lm_head_weight.transpose_dims(0, 1)?;
+        // This is expensive but we only do it once during model loading.
+        // If the weight is quantized (Q8_0/Q4_0), dequantize to F32 first —
+        // transpose is not supported on quantized tensors, and the LM head
+        // matmul operates in F32 anyway.
+        let lm_head_for_transpose = match lm_head_weight.dtype() {
+            DType::Q8_0 | DType::Q4_0 => lm_head_weight.to_dtype(DType::F32)?,
+            _ => lm_head_weight.clone(),
+        };
+        let lm_head_weight_transposed = lm_head_for_transpose.transpose_dims(0, 1)?;
 
         Ok(Qwen3ForCausalLM {
             model,
