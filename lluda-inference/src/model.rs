@@ -111,10 +111,12 @@ impl Qwen3Model {
     /// - Weight shapes don't match config
     /// - Layer construction fails
     fn load(config: &Qwen3Config, weights: &ModelWeights) -> Result<Self> {
+        let tp = &config.tensor_prefix; // "thinker." for Omni, "" for flat Qwen3
+
         // Load embedding
         let embed_weight = weights
-            .get("model.embed_tokens.weight")
-            .ok_or_else(|| LludaError::Msg("Missing embed_tokens.weight".into()))?
+            .get(&format!("{tp}model.embed_tokens.weight"))
+            .ok_or_else(|| LludaError::Msg(format!("Missing {tp}model.embed_tokens.weight")))?
             .clone();
         let embed_tokens = Embedding::new(embed_weight)?;
 
@@ -134,8 +136,8 @@ impl Qwen3Model {
 
         // Load final norm
         let norm_weight = weights
-            .get("model.norm.weight")
-            .ok_or_else(|| LludaError::Msg("Missing model.norm.weight".into()))?
+            .get(&format!("{tp}model.norm.weight"))
+            .ok_or_else(|| LludaError::Msg(format!("Missing {tp}model.norm.weight")))?
             .clone();
         let norm = RmsNorm::new(norm_weight, config.rms_norm_eps)?;
 
@@ -279,13 +281,16 @@ impl Qwen3ForCausalLM {
         let lm_head_weight = if config.tie_word_embeddings {
             model.embed_tokens.weight().clone()
         } else {
-            // If not tied, load separate lm_head.weight
+            // If not tied, load separate lm_head.weight.
+            // For Omni models the lm_head is at "{tensor_prefix}lm_head.weight".
+            let tp = &config.tensor_prefix;
+            let lm_head_key = format!("{tp}lm_head.weight");
             weights
-                .get("lm_head.weight")
+                .get(&lm_head_key)
                 .ok_or_else(|| {
-                    LludaError::Msg(
-                        "tie_word_embeddings=false requires lm_head.weight (not found)".into(),
-                    )
+                    LludaError::Msg(format!(
+                        "tie_word_embeddings=false requires {lm_head_key} (not found)"
+                    ))
                 })?
                 .clone()
         };
@@ -475,6 +480,11 @@ fn make_linear(weight: Tensor) -> Result<AnyLinear> {
     }
 }
 
+/// Load a bias tensor as a Vec<f32> from weights, returning None if not present.
+fn try_load_bias(weights: &ModelWeights, name: &str) -> Option<Vec<f32>> {
+    weights.get(name).map(|t| t.to_vec_f32())
+}
+
 /// Load a single decoder layer from weights.
 ///
 /// # Arguments
@@ -493,7 +503,8 @@ fn load_decoder_layer(
     layer_idx: usize,
     rotary: Arc<RotaryEmbedding>,
 ) -> Result<DecoderLayer> {
-    let prefix = format!("model.layers.{}", layer_idx);
+    let tp = &config.tensor_prefix; // "thinker." for Omni, "" for flat Qwen3
+    let prefix = format!("{tp}model.layers.{}", layer_idx);
 
     // Load attention projections
     let q_proj_weight = weights
@@ -513,23 +524,44 @@ fn load_decoder_layer(
         .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.o_proj.weight", prefix)))?
         .clone();
 
-    let q_proj = make_linear(q_proj_weight)?;
-    let k_proj = make_linear(k_proj_weight)?;
-    let v_proj = make_linear(v_proj_weight)?;
+    // Load optional bias tensors for q/k/v projections (present in Qwen2.5-Omni, absent in Qwen3)
+    let q_proj_bias = try_load_bias(weights, &format!("{}.self_attn.q_proj.bias", prefix));
+    let k_proj_bias = try_load_bias(weights, &format!("{}.self_attn.k_proj.bias", prefix));
+    let v_proj_bias = try_load_bias(weights, &format!("{}.self_attn.v_proj.bias", prefix));
+
+    let q_proj = make_linear(q_proj_weight)?.with_bias(q_proj_bias);
+    let k_proj = make_linear(k_proj_weight)?.with_bias(k_proj_bias);
+    let v_proj = make_linear(v_proj_weight)?.with_bias(v_proj_bias);
     let o_proj = make_linear(o_proj_weight)?;
 
-    // Load Q/K norms
-    let q_norm_weight = weights
-        .get(&format!("{}.self_attn.q_norm.weight", prefix))
-        .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.q_norm.weight", prefix)))?
-        .clone();
-    let k_norm_weight = weights
-        .get(&format!("{}.self_attn.k_norm.weight", prefix))
-        .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.k_norm.weight", prefix)))?
-        .clone();
+    // Load Q/K norms (optional: present in Qwen3 flat, absent in Qwen2.5-Omni)
+    let q_norm = if config.has_qk_norm {
+        let q_norm_weight = weights
+            .get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.q_norm.weight", prefix)))?
+            .clone();
+        Some(RmsNorm::new(q_norm_weight, config.rms_norm_eps)?)
+    } else {
+        // Try to load anyway; if not found, skip silently
+        weights
+            .get(&format!("{}.self_attn.q_norm.weight", prefix))
+            .map(|w| RmsNorm::new(w.clone(), config.rms_norm_eps))
+            .transpose()?
+    };
 
-    let q_norm = RmsNorm::new(q_norm_weight, config.rms_norm_eps)?;
-    let k_norm = RmsNorm::new(k_norm_weight, config.rms_norm_eps)?;
+    let k_norm = if config.has_qk_norm {
+        let k_norm_weight = weights
+            .get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .ok_or_else(|| LludaError::Msg(format!("Missing {}.self_attn.k_norm.weight", prefix)))?
+            .clone();
+        Some(RmsNorm::new(k_norm_weight, config.rms_norm_eps)?)
+    } else {
+        // Try to load anyway; if not found, skip silently
+        weights
+            .get(&format!("{}.self_attn.k_norm.weight", prefix))
+            .map(|w| RmsNorm::new(w.clone(), config.rms_norm_eps))
+            .transpose()?
+    };
 
     // Create attention layer
     let self_attn = Attention::new(

@@ -252,7 +252,7 @@ mod tests {
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
         let self_attn = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         ).unwrap();
 

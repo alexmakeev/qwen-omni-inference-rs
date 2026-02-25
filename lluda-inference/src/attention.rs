@@ -25,14 +25,17 @@ use crate::tensor::Tensor;
 
 /// Simple linear transformation layer (weight matrix multiplication).
 ///
-/// Computes `x @ weight.T` where weight is stored in [out_features, in_features] format
+/// Computes `x @ weight.T + bias` where weight is stored in [out_features, in_features] format
 /// (matching PyTorch convention).
 ///
-/// Qwen3 does not use bias terms in attention projections (`attention_bias: false`).
+/// Qwen3 flat models do not use bias terms (`attention_bias: false`).
+/// Qwen2.5-Omni uses bias on q/k/v projections.
 #[derive(Debug, Clone)]
 pub struct Linear {
     /// Weight matrix [out_features, in_features]
     pub(crate) weight: Tensor,
+    /// Optional bias vector [out_features]. None when attention_bias=false.
+    pub(crate) bias: Option<Vec<f32>>,
 }
 
 impl Linear {
@@ -44,7 +47,7 @@ impl Linear {
     ///
     /// # Returns
     ///
-    /// New Linear instance.
+    /// New Linear instance (no bias).
     ///
     /// # Errors
     ///
@@ -67,7 +70,31 @@ impl Linear {
                 got: weight.shape().to_vec(),
             });
         }
-        Ok(Linear { weight })
+        Ok(Linear { weight, bias: None })
+    }
+
+    /// Create a new linear layer from a weight tensor with an optional bias.
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - Weight tensor of shape [out_features, in_features]
+    /// * `bias` - Optional bias vector of shape [out_features]
+    ///
+    /// # Returns
+    ///
+    /// New Linear instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if weight is not a 2D tensor.
+    pub fn new_with_bias(weight: Tensor, bias: Option<Vec<f32>>) -> Result<Self> {
+        if weight.ndim() != 2 {
+            return Err(crate::error::LludaError::ShapeMismatch {
+                expected: vec![0, 0], // Expect 2D
+                got: weight.shape().to_vec(),
+            });
+        }
+        Ok(Linear { weight, bias })
     }
 
     /// Forward pass: compute `x @ weight.T`.
@@ -126,7 +153,16 @@ impl Linear {
         let weight_t = self.weight.transpose()?;
 
         // Compute: [batch, in_features] @ [in_features, out_features] -> [batch, out_features]
-        let output_2d = x_2d.matmul(&weight_t)?;
+        let mut output_2d = x_2d.matmul(&weight_t)?;
+
+        // Add bias if present: bias is [out_features], broadcast over batch
+        if let Some(bias) = &self.bias {
+            let mut data = output_2d.to_vec_f32();
+            for i in 0..data.len() {
+                data[i] += bias[i % out_features];
+            }
+            output_2d = crate::tensor::Tensor::new(data, vec![batch_size, out_features])?;
+        }
 
         // Reshape back to original shape with last dim = out_features
         let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
@@ -140,6 +176,7 @@ impl Linear {
 ///
 /// Weights are stored as Q8_0 blocks in [out_features, in_features] layout.
 /// Uses fused matmul_f32_x_quant — no dequantization during inference.
+/// Bias (if any) is stored in f32 and added after the quantized matmul.
 #[derive(Debug, Clone)]
 pub struct Q8Linear {
     /// Q8_0 quantized weight blocks, [out_features, in_features] layout
@@ -147,6 +184,8 @@ pub struct Q8Linear {
     weight_blocks: Vec<crate::quant::Q8Block>,
     out_features: usize,
     in_features: usize,
+    /// Optional bias vector [out_features] in f32 (not quantized).
+    bias: Option<Vec<f32>>,
 }
 
 impl Q8Linear {
@@ -180,6 +219,7 @@ impl Q8Linear {
             weight_blocks: blocks,
             out_features,
             in_features,
+            bias: None,
         })
     }
 
@@ -209,6 +249,18 @@ impl Q8Linear {
         let in_features = weight.shape()[1];
         let blocks = weight.into_q8_blocks()?;
         Self::from_blocks(blocks, out_features, in_features)
+    }
+
+    /// Create from a Tensor with Q8_0 dtype and an optional bias.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if tensor is not 2D.
+    /// Returns `DTypeMismatch` if tensor dtype is not Q8_0.
+    pub fn new_with_bias(weight: crate::tensor::Tensor, bias: Option<Vec<f32>>) -> crate::error::Result<Self> {
+        let mut layer = Self::new(weight)?;
+        layer.bias = bias;
+        Ok(layer)
     }
 
     /// Forward pass: x[..., in_features] -> out[..., out_features]
@@ -249,13 +301,20 @@ impl Q8Linear {
         };
 
         // Fused Q8 matmul: [batch, K] x [N, K/32 blocks] -> [batch, N]
-        let out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q8Block>(
+        let mut out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q8Block>(
             x_data,
             &self.weight_blocks,
             batch,
             self.in_features,
             self.out_features,
         );
+
+        // Add bias if present: bias is [out_features], broadcast over batch
+        if let Some(bias) = &self.bias {
+            for i in 0..out_data.len() {
+                out_data[i] += bias[i % self.out_features];
+            }
+        }
 
         // Reshape output to [..., out_features]
         let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
@@ -269,6 +328,7 @@ impl Q8Linear {
 ///
 /// Weights are stored as Q4_0 blocks in [out_features, in_features] layout.
 /// Uses fused matmul_f32_x_quant — no dequantization during inference.
+/// Bias (if any) is stored in f32 and added after the quantized matmul.
 #[derive(Debug, Clone)]
 pub struct Q4Linear {
     /// Q4_0 quantized weight blocks, [out_features, in_features] layout
@@ -276,6 +336,8 @@ pub struct Q4Linear {
     weight_blocks: Vec<crate::quant::Q4Block>,
     out_features: usize,
     in_features: usize,
+    /// Optional bias vector [out_features] in f32 (not quantized).
+    bias: Option<Vec<f32>>,
 }
 
 impl Q4Linear {
@@ -309,6 +371,7 @@ impl Q4Linear {
             weight_blocks: blocks,
             out_features,
             in_features,
+            bias: None,
         })
     }
 
@@ -338,6 +401,18 @@ impl Q4Linear {
         let in_features = weight.shape()[1];
         let blocks = weight.into_q4_blocks()?;
         Self::from_blocks(blocks, out_features, in_features)
+    }
+
+    /// Create from a Tensor with Q4_0 dtype and an optional bias.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeMismatch` if tensor is not 2D.
+    /// Returns `DTypeMismatch` if tensor dtype is not Q4_0.
+    pub fn new_with_bias(weight: crate::tensor::Tensor, bias: Option<Vec<f32>>) -> crate::error::Result<Self> {
+        let mut layer = Self::new(weight)?;
+        layer.bias = bias;
+        Ok(layer)
     }
 
     /// Forward pass: x[..., in_features] -> out[..., out_features]
@@ -378,13 +453,20 @@ impl Q4Linear {
         };
 
         // Fused Q4 matmul: [batch, K] x [N, K/32 blocks] -> [batch, N]
-        let out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q4Block>(
+        let mut out_data = crate::quant::matmul_f32_x_quant::<crate::quant::Q4Block>(
             x_data,
             &self.weight_blocks,
             batch,
             self.in_features,
             self.out_features,
         );
+
+        // Add bias if present: bias is [out_features], broadcast over batch
+        if let Some(bias) = &self.bias {
+            for i in 0..out_data.len() {
+                out_data[i] += bias[i % self.out_features];
+            }
+        }
 
         // Reshape output to [..., out_features]
         let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
@@ -427,13 +509,33 @@ impl AnyLinear {
             AnyLinear::Q4(q4linear) => [q4linear.out_features, q4linear.in_features],
         }
     }
+
+    /// Attach a bias vector to this linear layer.
+    ///
+    /// Replaces any existing bias. Pass `None` to clear the bias.
+    pub fn with_bias(self, bias: Option<Vec<f32>>) -> Self {
+        match self {
+            AnyLinear::F32(mut linear) => {
+                linear.bias = bias;
+                AnyLinear::F32(linear)
+            }
+            AnyLinear::Q8(mut q8linear) => {
+                q8linear.bias = bias;
+                AnyLinear::Q8(q8linear)
+            }
+            AnyLinear::Q4(mut q4linear) => {
+                q4linear.bias = bias;
+                AnyLinear::Q4(q4linear)
+            }
+        }
+    }
 }
 
-/// Grouped Query Attention with per-head Q/K normalization.
+/// Grouped Query Attention with optional per-head Q/K normalization.
 ///
 /// Key features:
 /// - Grouped query attention: Multiple query heads share KV heads
-/// - Per-head RMSNorm on queries and keys (unique to Qwen3)
+/// - Optional per-head RMSNorm on queries and keys (present in Qwen3, absent in Qwen2.5-Omni)
 /// - Rotary position embeddings (RoPE)
 /// - KV cache support for autoregressive generation
 ///
@@ -453,10 +555,10 @@ pub struct Attention {
     v_proj: AnyLinear,
     /// Output projection [num_heads * head_dim, hidden_size]
     o_proj: AnyLinear,
-    /// Query normalization [head_dim]
-    q_norm: RmsNorm,
-    /// Key normalization [head_dim]
-    k_norm: RmsNorm,
+    /// Optional query normalization [head_dim]. None for models without per-head QK norm.
+    q_norm: Option<RmsNorm>,
+    /// Optional key normalization [head_dim]. None for models without per-head QK norm.
+    k_norm: Option<RmsNorm>,
     /// Rotary position embeddings
     rotary: Arc<RotaryEmbedding>,
     /// Number of query heads
@@ -478,8 +580,8 @@ impl Attention {
     /// * `k_proj` - Key projection layer
     /// * `v_proj` - Value projection layer
     /// * `o_proj` - Output projection layer
-    /// * `q_norm` - Query normalization layer
-    /// * `k_norm` - Key normalization layer
+    /// * `q_norm` - Optional query normalization layer (Some for Qwen3, None for Qwen2.5-Omni)
+    /// * `k_norm` - Optional key normalization layer (Some for Qwen3, None for Qwen2.5-Omni)
     /// * `rotary` - Rotary position embeddings
     /// * `num_heads` - Number of query attention heads
     /// * `num_kv_heads` - Number of key/value heads
@@ -507,7 +609,7 @@ impl Attention {
     /// let k_norm = RmsNorm::new(Tensor::new(vec![1.0; head_dim], vec![head_dim]).unwrap(), 1e-6).unwrap();
     /// let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
     ///
-    /// let attn = Attention::new(q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads, head_dim).unwrap();
+    /// let attn = Attention::new(q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads, head_dim).unwrap();
     /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -515,8 +617,8 @@ impl Attention {
         k_proj: AnyLinear,
         v_proj: AnyLinear,
         o_proj: AnyLinear,
-        q_norm: RmsNorm,
-        k_norm: RmsNorm,
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
         rotary: Arc<RotaryEmbedding>,
         num_heads: usize,
         num_kv_heads: usize,
@@ -638,17 +740,25 @@ impl Attention {
             .reshape(&[batch, seq_len, self.num_kv_heads, self.head_dim])?
             .transpose_dims(1, 2)?;
 
-        // 3. Per-head RMSNorm on Q and K
-        // Flatten [B, H, L, D] -> [B*H*L, D] for per-head norm
-        let q_flat = q.reshape(&[batch * self.num_heads * seq_len, self.head_dim])?;
-        let k_flat = k.reshape(&[batch * self.num_kv_heads * seq_len, self.head_dim])?;
-
-        let q_normed = self.q_norm.forward(&q_flat)?;
-        let k_normed = self.k_norm.forward(&k_flat)?;
-
-        // Reshape back to [B, H, L, D]
-        let q = q_normed.reshape(&[batch, self.num_heads, seq_len, self.head_dim])?;
-        let k = k_normed.reshape(&[batch, self.num_kv_heads, seq_len, self.head_dim])?;
+        // 3. Per-head RMSNorm on Q and K (optional: present in Qwen3, absent in Qwen2.5-Omni)
+        let q = if let Some(q_norm) = &self.q_norm {
+            // Flatten [B, H, L, D] -> [B*H*L, D] for per-head norm
+            let q_flat = q.reshape(&[batch * self.num_heads * seq_len, self.head_dim])?;
+            let q_normed = q_norm.forward(&q_flat)?;
+            // Reshape back to [B, H, L, D]
+            q_normed.reshape(&[batch, self.num_heads, seq_len, self.head_dim])?
+        } else {
+            q
+        };
+        let k = if let Some(k_norm) = &self.k_norm {
+            // Flatten [B, H, L, D] -> [B*H*L, D] for per-head norm
+            let k_flat = k.reshape(&[batch * self.num_kv_heads * seq_len, self.head_dim])?;
+            let k_normed = k_norm.forward(&k_flat)?;
+            // Reshape back to [B, H, L, D]
+            k_normed.reshape(&[batch, self.num_kv_heads, seq_len, self.head_dim])?
+        } else {
+            k
+        };
 
         // 4. Apply RoPE
         let (q, k) = self.rotary.apply(&q, &k, offset)?;
@@ -1069,7 +1179,7 @@ mod tests {
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
         let attn = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         ).unwrap();
 
@@ -1127,7 +1237,7 @@ mod tests {
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
         let attn = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         ).unwrap();
 
@@ -1209,7 +1319,7 @@ mod tests {
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
         let attn = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         ).unwrap();
 
@@ -1381,7 +1491,7 @@ mod tests {
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 100, 10000.0).unwrap());
 
         let attn = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         ).unwrap();
 
@@ -1463,7 +1573,7 @@ mod tests {
 
         // This should return error
         let result = Attention::new(
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rotary, num_heads, num_kv_heads,
+            q_proj, k_proj, v_proj, o_proj, Some(q_norm), Some(k_norm), rotary, num_heads, num_kv_heads,
             head_dim,
         );
 

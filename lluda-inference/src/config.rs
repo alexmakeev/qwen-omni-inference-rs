@@ -2,10 +2,51 @@
 //!
 //! Loads and parses the HuggingFace `config.json` file to extract
 //! model hyperparameters needed for architecture construction.
+//!
+//! Supports both flat Qwen3 configs and nested Qwen2.5-Omni configs.
+//! Auto-detection is based on the presence of `thinker_config` key.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Private helper structs for Qwen2.5-Omni nested config deserialization.
+// These are used only in `from_file()` and not exposed publicly.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Flat text model parameters nested inside `thinker_config.text_config`.
+#[derive(Debug, Deserialize)]
+struct OmniTextConfigRaw {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    vocab_size: usize,
+    max_position_embeddings: usize,
+    rope_theta: f64,
+    rms_norm_eps: f64,
+    hidden_act: String,
+    #[serde(default)]
+    attention_dropout: f64,
+    #[serde(default)]
+    tie_word_embeddings: bool,
+}
+
+/// Top-level `thinker_config` object in an Omni config.
+#[derive(Debug, Deserialize)]
+struct OmniThinkerConfigRaw {
+    text_config: OmniTextConfigRaw,
+    bos_token_id: u32,
+    eos_token_id: EosTokenId,
+}
+
+/// Root structure for Qwen2.5-Omni `config.json`.
+#[derive(Debug, Deserialize)]
+struct OmniConfigRaw {
+    thinker_config: OmniThinkerConfigRaw,
+}
 
 /// Configuration for Qwen3 models.
 ///
@@ -79,6 +120,20 @@ pub struct Qwen3Config {
     /// For Qwen3-0.6B: true (embedding weight is reused as LM head)
     #[serde(default)]
     pub tie_word_embeddings: bool,
+
+    /// Tensor name prefix for weight lookup.
+    /// Empty string for flat Qwen3 models, "thinker." for Qwen2.5-Omni.
+    #[serde(default)]
+    pub tensor_prefix: String,
+
+    /// Whether attention layers have per-head Q/K RMSNorm.
+    /// True for Qwen3 flat models, false for Qwen2.5-Omni.
+    #[serde(default = "default_true")]
+    pub has_qk_norm: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// EOS token ID configuration.
@@ -99,6 +154,12 @@ pub enum EosTokenId {
 impl Qwen3Config {
     /// Load configuration from a JSON file.
     ///
+    /// Automatically detects whether the file is a flat Qwen3 config or a
+    /// nested Qwen2.5-Omni config (detected by the presence of a top-level
+    /// `thinker_config` key). In the Omni case the text model parameters are
+    /// extracted from `thinker_config.text_config` and the token IDs from
+    /// `thinker_config` itself.
+    ///
     /// # Arguments
     /// * `path` - Path to the `config.json` file
     ///
@@ -115,8 +176,41 @@ impl Qwen3Config {
     /// ```
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Qwen3Config = serde_json::from_str(&contents)?;
-        Ok(config)
+
+        // Use serde_json::Value for format detection before full deserialization.
+        let value: serde_json::Value = serde_json::from_str(&contents)?;
+
+        if value.get("thinker_config").is_some() {
+            // Qwen2.5-Omni nested format: extract text params from thinker_config.
+            let omni: OmniConfigRaw = serde_json::from_value(value)?;
+            let tc = omni.thinker_config;
+            let txt = tc.text_config;
+            let head_dim = txt.hidden_size / txt.num_attention_heads;
+            Ok(Qwen3Config {
+                hidden_size: txt.hidden_size,
+                intermediate_size: txt.intermediate_size,
+                num_hidden_layers: txt.num_hidden_layers,
+                num_attention_heads: txt.num_attention_heads,
+                num_key_value_heads: txt.num_key_value_heads,
+                head_dim,
+                vocab_size: txt.vocab_size,
+                max_position_embeddings: txt.max_position_embeddings,
+                rope_theta: txt.rope_theta,
+                rms_norm_eps: txt.rms_norm_eps,
+                hidden_act: txt.hidden_act,
+                attention_bias: false,
+                attention_dropout: txt.attention_dropout,
+                bos_token_id: tc.bos_token_id,
+                eos_token_id: tc.eos_token_id,
+                tie_word_embeddings: txt.tie_word_embeddings,
+                tensor_prefix: "thinker.".to_string(),
+                has_qk_norm: false,
+            })
+        } else {
+            // Flat Qwen3 format.
+            let config: Qwen3Config = serde_json::from_value(value)?;
+            Ok(config)
+        }
     }
 
     /// Get number of KV groups for Grouped Query Attention.
@@ -345,5 +439,81 @@ mod tests {
         assert_eq!(config.hidden_size, deserialized.hidden_size);
         assert_eq!(config.num_hidden_layers, deserialized.num_hidden_layers);
         assert_eq!(config.vocab_size, deserialized.vocab_size);
+    }
+
+    /// Unit test for Omni nested config using inline JSON written to a temp file.
+    /// Verifies correct extraction of text model parameters from thinker_config
+    /// through the public `from_file()` entry point.
+    #[test]
+    fn test_omni_config_inline() {
+        // Minimal Omni-style config with nested thinker_config.text_config structure.
+        let json = r#"{
+            "model_type": "qwen2_5_omni",
+            "thinker_config": {
+                "bos_token_id": 151644,
+                "eos_token_id": 151645,
+                "text_config": {
+                    "hidden_size": 2048,
+                    "intermediate_size": 11008,
+                    "num_hidden_layers": 36,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 151936,
+                    "max_position_embeddings": 32768,
+                    "rope_theta": 1000000.0,
+                    "rms_norm_eps": 1e-6,
+                    "hidden_act": "silu",
+                    "attention_dropout": 0.0,
+                    "tie_word_embeddings": false
+                }
+            }
+        }"#;
+
+        // Write to a temp file so we exercise the full from_file() path.
+        let tmp = std::env::temp_dir().join("lluda_test_omni_config.json");
+        std::fs::write(&tmp, json).expect("failed to write temp config");
+
+        let config = Qwen3Config::from_file(&tmp).expect("failed to parse inline Omni config");
+
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_hidden_layers, 36);
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.head_dim, 128); // computed: 2048 / 16
+        assert!(!config.attention_bias);
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.rope_theta, 1000000.0);
+        assert_eq!(config.bos_token_id, 151644);
+        match &config.eos_token_id {
+            EosTokenId::Single(id) => assert_eq!(*id, 151645),
+            EosTokenId::Multiple(_) => panic!("Expected Single eos_token_id"),
+        }
+
+        // Clean up temp file.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Integration test: load real Qwen2.5-Omni-3B config via `from_file()`.
+    /// Skipped gracefully when the model directory is not present.
+    #[test]
+    fn test_load_omni_config() {
+        let path = "/home/alexmak/lluda/models/Qwen2.5-Omni-3B/config.json";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping test_load_omni_config: model file not found at {path}");
+            return;
+        }
+
+        let config = Qwen3Config::from_file(path).expect("failed to parse Omni config");
+
+        // Values derived from actual config.json inspection.
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_hidden_layers, 36);
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.head_dim, 128); // computed: 2048 / 16
+        assert!(!config.attention_bias);
+        assert_eq!(config.bos_token_id, 151644);
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.rope_theta, 1000000.0);
     }
 }
