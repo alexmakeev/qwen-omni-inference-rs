@@ -1989,6 +1989,67 @@ impl Tensor {
         }
     }
 
+    /// Applies the GELU (Gaussian Error Linear Unit) activation function element-wise.
+    ///
+    /// Uses the exact tanh approximation matching PyTorch's default GELU:
+    /// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`
+    ///
+    /// # Returns
+    ///
+    /// Tensor with GELU activation applied element-wise.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lluda_inference::tensor::Tensor;
+    ///
+    /// let t = Tensor::new(vec![0.0, 1.0, -1.0], vec![3]).unwrap();
+    /// let g = t.gelu().unwrap();
+    ///
+    /// let result = g.to_vec_f32();
+    /// assert!((result[0] - 0.0).abs() < 1e-6);        // gelu(0) = 0
+    /// assert!((result[1] - 0.8412).abs() < 1e-3);     // gelu(1) ≈ 0.8412
+    /// assert!((result[2] - (-0.1588)).abs() < 1e-3);  // gelu(-1) ≈ -0.1588
+    /// ```
+    pub fn gelu(&self) -> Result<Tensor> {
+        use crate::bf16::BF16;
+
+        // sqrt(2/π) — constant for GELU tanh approximation
+        const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+        const COEFF: f32 = 0.044715;
+
+        let gelu_f32 = |x: f32| -> f32 {
+            0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + COEFF * x * x * x)).tanh())
+        };
+
+        match &self.data {
+            TensorData::BF16(data) => {
+                let result: Vec<BF16> = data
+                    .iter()
+                    .map(|&x| {
+                        // Compute in F32 for precision, convert back to BF16
+                        let x_f32: f32 = x.into();
+                        BF16::from(gelu_f32(x_f32))
+                    })
+                    .collect();
+                Tensor::from_bf16(result, self.shape.clone())
+            }
+            TensorData::F32(data) => {
+                let result: Vec<f32> = data
+                    .iter()
+                    .map(|&x| gelu_f32(x))
+                    .collect();
+                Tensor::new(result, self.shape.clone())
+            }
+            #[cfg(feature = "gpu")]
+            TensorData::GpuBuffer { .. } => {
+                Err(LludaError::Msg(
+                    "GELU on GPU tensors not yet implemented. Use to_cpu() first.".into()
+                ))
+            }
+        }
+    }
+
     /// Compute mean along a dimension.
     ///
     /// # Arguments
@@ -4825,6 +4886,21 @@ mod tests {
         let result = s.to_vec_f32();
         assert!((result[0] - 0.0).abs() < 1e-5);
         assert!((result[1] - 0.7311).abs() < 1e-3);
+    }
+
+    // ========== GELU Tests ==========
+
+    #[test]
+    fn test_gelu() {
+        let t = Tensor::new(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![5]).unwrap();
+        let result = t.gelu().unwrap();
+        let data = result.to_vec_f32();
+        // PyTorch reference values for GELU
+        assert!((data[0] - (-0.0454)).abs() < 1e-3);  // gelu(-2) ≈ -0.0454
+        assert!((data[1] - (-0.1588)).abs() < 1e-3);  // gelu(-1) ≈ -0.1588
+        assert!((data[2] - 0.0).abs() < 1e-6);         // gelu(0) = 0
+        assert!((data[3] - 0.8412).abs() < 1e-3);      // gelu(1) ≈ 0.8412
+        assert!((data[4] - 1.9546).abs() < 1e-3);      // gelu(2) ≈ 1.9546
     }
 
     // ========== Mean Tests ==========

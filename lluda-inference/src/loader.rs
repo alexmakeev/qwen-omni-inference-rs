@@ -1,9 +1,10 @@
 //! SafeTensors model weight loader.
 //!
 //! Provides memory-mapped loading of model weights from SafeTensors format.
-//! The loader uses mmap to avoid loading the entire 1.5GB model file into RAM.
+//! The loader uses mmap to avoid loading the entire model file into RAM.
+//! Supports both single-file and multi-shard (sharded) safetensors files.
 //!
-//! # Example
+//! # Example — single file
 //!
 //! ```rust,no_run
 //! use lluda_inference::loader::ModelWeights;
@@ -13,6 +14,17 @@
 //! // Get embedding weights
 //! let embed = weights.get("model.embed_tokens.weight").unwrap();
 //! assert_eq!(embed.shape(), &[151936, 1024]);
+//! # Ok::<(), lluda_inference::error::LludaError>(())
+//! ```
+//!
+//! # Example — sharded model directory
+//!
+//! ```rust,no_run
+//! use lluda_inference::loader::ModelWeights;
+//!
+//! // Loads model-00001-of-00003.safetensors, model-00002-of-00003.safetensors, ...
+//! let weights = ModelWeights::from_directory("models/Qwen2.5-Omni-3B")?;
+//! println!("Loaded {} tensors", weights.len());
 //! # Ok::<(), lluda_inference::error::LludaError>(())
 //! ```
 
@@ -30,13 +42,15 @@ use crate::tensor::Tensor;
 /// Container for model weights loaded from SafeTensors format.
 ///
 /// Uses memory mapping to efficiently access large model files without
-/// loading everything into RAM. The underlying mmap is shared via Arc
-/// so cloning tensors is cheap.
+/// loading everything into RAM. All underlying mmaps are kept alive via Arc
+/// for the lifetime of the weights container.
+///
+/// Supports both single-file and multi-shard (sharded) safetensors models.
 #[derive(Debug)]
 pub struct ModelWeights {
     weights: HashMap<String, Tensor>,
     #[allow(dead_code)]
-    mmap: Arc<Mmap>, // Keep mmap alive for the lifetime of weights
+    mmaps: Vec<Arc<Mmap>>, // Keep all mmaps alive for the lifetime of weights
 }
 
 impl ModelWeights {
@@ -66,29 +80,145 @@ impl ModelWeights {
     /// # Ok::<(), lluda_inference::error::LludaError>(())
     /// ```
     pub fn from_safetensors(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::from_safetensors_shards(&[path])
+    }
 
-        // Memory-map the file (don't load 1.5GB into RAM)
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let mmap = Arc::new(mmap);
-
-        // Parse SafeTensors header and metadata
-        let tensors = SafeTensors::deserialize(&mmap)
-            .map_err(|e| LludaError::SafeTensors(format!("Failed to parse SafeTensors: {}", e)))?;
-
-        // Load each tensor from the mmap
+    /// Load weights from multiple safetensors shard files.
+    ///
+    /// Memory-maps each shard and builds a unified weight map across all shards.
+    /// All mmaps are kept alive for the lifetime of the returned `ModelWeights`.
+    ///
+    /// Duplicate tensor names across shards are an error — each shard must
+    /// contain disjoint sets of tensor names.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Ordered list of paths to shard files
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Any shard file is not found or cannot be opened
+    /// - Any shard has an invalid SafeTensors format
+    /// - A tensor name appears in more than one shard
+    /// - Unsupported data type (only BF16 and F32 are supported)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::loader::ModelWeights;
+    ///
+    /// let shards = [
+    ///     "models/Qwen2.5-Omni-3B/model-00001-of-00003.safetensors",
+    ///     "models/Qwen2.5-Omni-3B/model-00002-of-00003.safetensors",
+    ///     "models/Qwen2.5-Omni-3B/model-00003-of-00003.safetensors",
+    /// ];
+    /// let weights = ModelWeights::from_safetensors_shards(&shards)?;
+    /// println!("Loaded {} tensors from {} shards", weights.len(), shards.len());
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn from_safetensors_shards(paths: &[impl AsRef<Path>]) -> Result<Self> {
+        let mut mmaps = Vec::with_capacity(paths.len());
         let mut weights = HashMap::new();
 
-        for (name, view) in tensors.tensors() {
-            let tensor = load_tensor(&view)?;
-            weights.insert(name.to_string(), tensor);
+        for path in paths {
+            let path = path.as_ref();
+
+            // Memory-map the shard file (don't load it all into RAM)
+            let file = std::fs::File::open(path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let mmap = Arc::new(mmap);
+
+            // Parse SafeTensors header and metadata
+            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
+                LludaError::SafeTensors(format!(
+                    "Failed to parse SafeTensors '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+            // Load each tensor from this shard into the unified weight map
+            for (name, view) in tensors.tensors() {
+                if weights.contains_key(&name) {
+                    return Err(LludaError::SafeTensors(format!(
+                        "Duplicate tensor '{}' found in shard '{}'",
+                        name,
+                        path.display()
+                    )));
+                }
+                let tensor = load_tensor(&name, &view)?;
+                weights.insert(name, tensor);
+            }
+
+            // Keep mmap alive — tensors reference its memory
+            mmaps.push(mmap);
         }
 
-        Ok(Self {
-            weights,
-            mmap,
-        })
+        Ok(Self { weights, mmaps })
+    }
+
+    /// Load all safetensors files from a model directory.
+    ///
+    /// Finds all `*.safetensors` files in `dir`, sorts them by name
+    /// (alphabetical order ensures correct shard ordering for files
+    /// named like `model-00001-of-00003.safetensors`), and loads them all.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` - Path to the model directory
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Directory does not exist or cannot be read
+    /// - No `.safetensors` files are found in the directory
+    /// - Any shard fails to load (see [`from_safetensors_shards`])
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use lluda_inference::loader::ModelWeights;
+    ///
+    /// let weights = ModelWeights::from_directory("models/Qwen2.5-Omni-3B")?;
+    /// println!("Loaded {} tensors", weights.len());
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn from_directory(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+
+        // Collect all *.safetensors paths in this directory
+        let read_dir = std::fs::read_dir(dir).map_err(|e| {
+            LludaError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Cannot read directory '{}': {}", dir.display(), e),
+            ))
+        })?;
+
+        let mut shard_paths: Vec<std::path::PathBuf> = read_dir
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if shard_paths.is_empty() {
+            return Err(LludaError::SafeTensors(format!(
+                "No .safetensors files found in directory '{}'",
+                dir.display()
+            )));
+        }
+
+        // Sort alphabetically so shards load in the correct order
+        // (e.g. model-00001-of-00003 before model-00002-of-00003)
+        shard_paths.sort();
+
+        Self::from_safetensors_shards(&shard_paths)
     }
 
     /// Get a tensor by name.
@@ -126,23 +256,55 @@ impl ModelWeights {
     }
 }
 
+/// Decide whether a tensor should be quantized (e.g. BF16→Q8).
+///
+/// Only 2D weight matrices are candidates for quantization. Several
+/// special-purpose tensors must stay in their original dtype:
+///
+/// - `embed_tokens` — token embedding tables: discrete lookups, not GEMM
+/// - `positional_embedding` — sinusoidal lookup table, fixed values
+/// - `audio_bos_eos_token` — special audio boundary tokens
+///
+/// Biases (1D) and convolution kernels (3D+) are not quantized either,
+/// but that is enforced by the `shape.len() != 2` guard.
+pub fn should_quantize(name: &str, shape: &[usize]) -> bool {
+    // Only quantize 2D tensors (weight matrices)
+    if shape.len() != 2 {
+        return false;
+    }
+
+    // Skip embedding tables and lookup tensors: they are used for indexing,
+    // not matrix-vector products, so quantization hurts quality without helping throughput.
+    if name.contains("embed_tokens")
+        || name.contains("positional_embedding")
+        || name.contains("audio_bos_eos_token")
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Load a single tensor from a SafeTensors tensor view.
 ///
 /// Converts raw bytes to our Tensor type based on dtype.
-fn load_tensor(view: &safetensors::tensor::TensorView) -> Result<Tensor> {
+/// The tensor name is provided so that quantization exclusion rules
+/// (`should_quantize`) can be consulted when quantization is applied.
+fn load_tensor(name: &str, view: &safetensors::tensor::TensorView) -> Result<Tensor> {
     let shape = view.shape().to_vec();
     let dtype = view.dtype();
     let data_bytes = view.data();
 
     match dtype {
         safetensors::Dtype::BF16 => {
-            // Load as BF16
-            // SafeTensors stores BF16 as u16 in little-endian byte order
+            // Load as BF16.
+            // SafeTensors stores BF16 as u16 in little-endian byte order.
             let num_elements = shape.iter().product::<usize>();
 
             if data_bytes.len() != num_elements * 2 {
                 return Err(LludaError::SafeTensors(format!(
-                    "BF16 tensor size mismatch: expected {} bytes, got {}",
+                    "BF16 tensor '{}' size mismatch: expected {} bytes, got {}",
+                    name,
                     num_elements * 2,
                     data_bytes.len()
                 )));
@@ -155,6 +317,11 @@ fn load_tensor(view: &safetensors::tensor::TensorView) -> Result<Tensor> {
                 bf16_data.push(BF16::from_bits(bits));
             }
 
+            // Note: quantization guard is in place for when Q8 quantization is added.
+            // If should_quantize(name, &shape) is true, the tensor is a candidate for
+            // BF16→Q8 conversion. Currently we keep all tensors as BF16.
+            let _ = should_quantize(name, &shape); // documents intent; no-op for now
+
             Tensor::from_bf16(bf16_data, shape)
         }
 
@@ -164,7 +331,8 @@ fn load_tensor(view: &safetensors::tensor::TensorView) -> Result<Tensor> {
 
             if data_bytes.len() != num_elements * 4 {
                 return Err(LludaError::SafeTensors(format!(
-                    "F32 tensor size mismatch: expected {} bytes, got {}",
+                    "F32 tensor '{}' size mismatch: expected {} bytes, got {}",
+                    name,
                     num_elements * 4,
                     data_bytes.len()
                 )));
@@ -181,8 +349,8 @@ fn load_tensor(view: &safetensors::tensor::TensorView) -> Result<Tensor> {
         }
 
         other => Err(LludaError::SafeTensors(format!(
-            "Unsupported dtype: {:?}. Only BF16 and F32 are supported.",
-            other
+            "Unsupported dtype {:?} for tensor '{}'. Only BF16 and F32 are supported.",
+            other, name
         ))),
     }
 }
@@ -203,6 +371,78 @@ mod tests {
             None
         }
     }
+
+    // -------------------------------------------------------------------------
+    // should_quantize unit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_should_quantize() {
+        // Regular weight matrix → should quantize
+        assert!(should_quantize(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[1024, 1024]
+        ));
+
+        // Token embedding table → must NOT quantize (discrete lookup)
+        assert!(!should_quantize(
+            "model.embed_tokens.weight",
+            &[151936, 1024]
+        ));
+
+        // Positional embedding → must NOT quantize (sinusoidal lookup table)
+        assert!(!should_quantize(
+            "thinker.audio_tower.positional_embedding",
+            &[1500, 1280]
+        ));
+
+        // Audio boundary token → must NOT quantize
+        assert!(!should_quantize(
+            "thinker.audio_tower.audio_bos_eos_token.weight",
+            &[2, 1280]
+        ));
+
+        // Conv weight (3D) → must NOT quantize
+        assert!(!should_quantize(
+            "thinker.audio_tower.conv1.weight",
+            &[1280, 128, 3]
+        ));
+
+        // Layer norm (1D) → must NOT quantize
+        assert!(!should_quantize(
+            "model.layers.0.input_layernorm.weight",
+            &[1024]
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Directory loader tests (offline, no real model files needed)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_from_directory_nonexistent() {
+        let result = ModelWeights::from_directory("/nonexistent/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_directory_empty_dir() {
+        // Create a temp dir with no .safetensors files
+        let tmp = std::env::temp_dir().join("lluda_test_empty_dir");
+        let _ = std::fs::create_dir_all(&tmp);
+        // Put a non-safetensors file in there so the dir exists and is readable
+        let _ = std::fs::write(tmp.join("config.json"), "{}");
+
+        let result = ModelWeights::from_directory(&tmp);
+        assert!(result.is_err(), "Should error when no .safetensors files found");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -------------------------------------------------------------------------
+    // Single-file loader tests (require model files)
+    // -------------------------------------------------------------------------
 
     #[test]
     fn test_load_qwen3_06b_weights() {
@@ -271,26 +511,14 @@ mod tests {
         // Check attention projection shapes (layer 0)
         // Q: [num_heads * head_dim, hidden_size] = [16 * 128, 1024] = [2048, 1024]
         let q_proj = weights.get("model.layers.0.self_attn.q_proj.weight").unwrap();
-        assert_eq!(
-            q_proj.shape(),
-            &[2048, 1024],
-            "Q projection shape mismatch"
-        );
+        assert_eq!(q_proj.shape(), &[2048, 1024], "Q projection shape mismatch");
 
         // K, V: [num_kv_heads * head_dim, hidden_size] = [8 * 128, 1024] = [1024, 1024]
         let k_proj = weights.get("model.layers.0.self_attn.k_proj.weight").unwrap();
-        assert_eq!(
-            k_proj.shape(),
-            &[1024, 1024],
-            "K projection shape mismatch"
-        );
+        assert_eq!(k_proj.shape(), &[1024, 1024], "K projection shape mismatch");
 
         let v_proj = weights.get("model.layers.0.self_attn.v_proj.weight").unwrap();
-        assert_eq!(
-            v_proj.shape(),
-            &[1024, 1024],
-            "V projection shape mismatch"
-        );
+        assert_eq!(v_proj.shape(), &[1024, 1024], "V projection shape mismatch");
 
         // O: [hidden_size, num_heads * head_dim] = [1024, 2048]
         let o_proj = weights.get("model.layers.0.self_attn.o_proj.weight").unwrap();
@@ -495,5 +723,32 @@ mod tests {
 
         assert!(!weights.is_empty(), "Should have tensors");
         assert!(!weights.is_empty(), "Should not be empty");
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-shard tests (require model files)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_from_safetensors_shards_single_shard() {
+        // A single-element slice must behave identically to from_safetensors
+        let Some(path) = get_model_path() else {
+            return;
+        };
+
+        let single = ModelWeights::from_safetensors(&path).unwrap();
+        let sharded = ModelWeights::from_safetensors_shards(&[&path]).unwrap();
+
+        assert_eq!(
+            single.len(),
+            sharded.len(),
+            "Single shard must have same tensor count as from_safetensors"
+        );
+    }
+
+    #[test]
+    fn test_from_safetensors_shards_missing_file() {
+        let result = ModelWeights::from_safetensors_shards(&["/nonexistent/shard.safetensors"]);
+        assert!(result.is_err(), "Should error on missing shard file");
     }
 }

@@ -129,6 +129,255 @@ impl Qwen3Config {
     }
 }
 
+// ── Qwen2.5-Omni configuration ────────────────────────────────────────────────
+
+/// Audio encoder configuration (Whisper-style).
+///
+/// Corresponds to `thinker_config.audio_config` in the Qwen2.5-Omni `config.json`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OmniAudioConfig {
+    /// Hidden dimension of the audio encoder.
+    /// For Qwen2.5-Omni-3B: 1280
+    pub d_model: usize,
+
+    /// Number of encoder transformer layers.
+    /// For Qwen2.5-Omni-3B: 32
+    pub encoder_layers: usize,
+
+    /// Number of encoder attention heads.
+    /// For Qwen2.5-Omni-3B: 20
+    pub encoder_attention_heads: usize,
+
+    /// Feed-forward network dimension in the encoder.
+    /// For Qwen2.5-Omni-3B: 5120
+    pub encoder_ffn_dim: usize,
+
+    /// Output projection dimension (to text model hidden size).
+    /// For Qwen2.5-Omni-3B: 2048
+    pub output_dim: usize,
+
+    /// Number of mel frequency bins for audio preprocessing.
+    /// For Qwen2.5-Omni-3B: 128
+    pub num_mel_bins: usize,
+
+    /// LayerNorm epsilon for numerical stability.
+    /// Defaults to 1e-5 when not present in the config file.
+    #[serde(default = "default_audio_eps")]
+    pub layer_norm_eps: f64,
+}
+
+fn default_audio_eps() -> f64 {
+    1e-5
+}
+
+/// Talker (TTS decoder) configuration.
+///
+/// Corresponds to `talker_config` in the Qwen2.5-Omni `config.json`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OmniTalkerConfig {
+    /// Hidden dimension of the talker model.
+    /// For Qwen2.5-Omni-3B: 896
+    pub hidden_size: usize,
+
+    /// MLP intermediate dimension size.
+    /// For Qwen2.5-Omni-3B: 4864
+    pub intermediate_size: usize,
+
+    /// Number of transformer decoder layers.
+    /// For Qwen2.5-Omni-3B: 24
+    pub num_hidden_layers: usize,
+
+    /// Number of query attention heads.
+    /// For Qwen2.5-Omni-3B: 14
+    pub num_attention_heads: usize,
+
+    /// Number of key/value attention heads (for GQA).
+    /// For Qwen2.5-Omni-3B: 2
+    pub num_key_value_heads: usize,
+
+    /// Dimension of each attention head.
+    /// For Qwen2.5-Omni-3B: 64
+    pub head_dim: usize,
+
+    /// Vocabulary size (codec tokens).
+    /// For Qwen2.5-Omni-3B: 8448
+    pub vocab_size: usize,
+
+    /// Audio embedding dimension matching the thinker output.
+    /// For Qwen2.5-Omni-3B: 2048
+    pub embedding_size: usize,
+
+    /// RMSNorm epsilon for numerical stability.
+    /// For Qwen2.5-Omni-3B: 1e-6
+    pub rms_norm_eps: f64,
+
+    /// RoPE theta base frequency.
+    /// For Qwen2.5-Omni-3B: 1000000.0
+    pub rope_theta: f64,
+
+    /// Maximum sequence length for positional embeddings.
+    /// For Qwen2.5-Omni-3B: 32768
+    pub max_position_embeddings: usize,
+
+    /// Whether attention layers have bias terms.
+    /// For Qwen2.5-Omni-3B: absent in config (defaults to false)
+    #[serde(default)]
+    pub attention_bias: bool,
+
+    /// Start token ID for TTS codec output.
+    /// For Qwen2.5-Omni-3B: 8293
+    #[serde(default = "default_tts_codec_start", rename = "tts_codec_start_token_id")]
+    pub tts_codec_start: u32,
+
+    /// End token ID for TTS codec output.
+    /// For Qwen2.5-Omni-3B: 8294
+    #[serde(default = "default_tts_codec_end", rename = "tts_codec_end_token_id")]
+    pub tts_codec_end: u32,
+
+    /// Pad token ID for TTS codec output.
+    /// For Qwen2.5-Omni-3B: 8292
+    #[serde(default = "default_tts_codec_pad", rename = "tts_codec_pad_token_id")]
+    pub tts_codec_pad: u32,
+}
+
+fn default_tts_codec_start() -> u32 {
+    8293
+}
+fn default_tts_codec_end() -> u32 {
+    8294
+}
+fn default_tts_codec_pad() -> u32 {
+    8292
+}
+
+/// Text model configuration within the thinker.
+///
+/// Corresponds to `thinker_config.text_config` in the Qwen2.5-Omni `config.json`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OmniTextConfig {
+    /// Hidden dimension size (embedding dimension).
+    /// For Qwen2.5-Omni-3B: 2048
+    pub hidden_size: usize,
+
+    /// MLP intermediate dimension size.
+    /// For Qwen2.5-Omni-3B: 11008
+    pub intermediate_size: usize,
+
+    /// Number of transformer decoder layers.
+    /// For Qwen2.5-Omni-3B: 36
+    pub num_hidden_layers: usize,
+
+    /// Number of query attention heads.
+    /// For Qwen2.5-Omni-3B: 16
+    pub num_attention_heads: usize,
+
+    /// Number of key/value attention heads (for GQA).
+    /// For Qwen2.5-Omni-3B: 2
+    pub num_key_value_heads: usize,
+
+    /// Dimension of each attention head.
+    /// Defaults to 128 when not present in the config file.
+    #[serde(default = "default_omni_text_head_dim")]
+    pub head_dim: usize,
+
+    /// Vocabulary size.
+    /// For Qwen2.5-Omni-3B: 151936
+    pub vocab_size: usize,
+
+    /// RMSNorm epsilon for numerical stability.
+    /// For Qwen2.5-Omni-3B: 1e-6
+    pub rms_norm_eps: f64,
+
+    /// RoPE theta base frequency.
+    /// For Qwen2.5-Omni-3B: 1000000.0
+    pub rope_theta: f64,
+
+    /// Maximum sequence length for positional embeddings.
+    /// For Qwen2.5-Omni-3B: 32768
+    pub max_position_embeddings: usize,
+
+    /// Whether attention layers have bias terms.
+    /// For Qwen2.5-Omni-3B: absent in config (defaults to false)
+    #[serde(default)]
+    pub attention_bias: bool,
+
+    /// Whether word embeddings are tied with LM head.
+    /// For Qwen2.5-Omni-3B: false
+    pub tie_word_embeddings: bool,
+}
+
+fn default_omni_text_head_dim() -> usize {
+    128
+}
+
+/// Thinker (main multimodal model) configuration wrapper.
+///
+/// Corresponds to `thinker_config` in the Qwen2.5-Omni `config.json`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OmniThinkerConfig {
+    /// Language model backbone configuration.
+    pub text_config: OmniTextConfig,
+
+    /// Whisper-style audio encoder configuration.
+    pub audio_config: OmniAudioConfig,
+
+    /// Token ID used to represent audio spans in the text sequence.
+    /// Defaults to 151646 when not present in the config file.
+    #[serde(default = "default_audio_token_index")]
+    pub audio_token_index: u32,
+}
+
+fn default_audio_token_index() -> u32 {
+    151646
+}
+
+/// Top-level Qwen2.5-Omni model configuration.
+///
+/// Loaded from HuggingFace `config.json` for Qwen2.5-Omni models.
+/// The config is structured as nested sub-configs for each component.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OmniConfig {
+    /// Thinker (main language + audio understanding) sub-config.
+    pub thinker_config: OmniThinkerConfig,
+
+    /// Talker (TTS decoder) sub-config.
+    pub talker_config: OmniTalkerConfig,
+
+    /// Whether audio output generation is enabled.
+    /// For Qwen2.5-Omni-3B: true
+    #[serde(default)]
+    pub enable_audio_output: bool,
+
+    /// Whether the talker component is active.
+    /// For Qwen2.5-Omni-3B: true
+    #[serde(default)]
+    pub enable_talker: bool,
+}
+
+impl OmniConfig {
+    /// Load configuration from a JSON file.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the `config.json` file
+    ///
+    /// # Returns
+    /// Parsed configuration or error if file cannot be read or JSON is invalid.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use lluda_inference::config::OmniConfig;
+    ///
+    /// let config = OmniConfig::from_file("models/Qwen2.5-Omni-3B/config.json")?;
+    /// assert_eq!(config.thinker_config.text_config.hidden_size, 2048);
+    /// # Ok::<(), lluda_inference::error::LludaError>(())
+    /// ```
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: OmniConfig = serde_json::from_str(&contents)?;
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +541,22 @@ mod tests {
         assert_eq!(config.hidden_size, deserialized.hidden_size);
         assert_eq!(config.num_hidden_layers, deserialized.num_hidden_layers);
         assert_eq!(config.vocab_size, deserialized.vocab_size);
+    }
+
+    #[test]
+    fn test_omni_config_from_file() {
+        let path = "/home/alexmak/lluda/models/Qwen2.5-Omni-3B/config.json";
+        if !std::path::Path::new(path).exists() {
+            return; // skip if model not available
+        }
+        let config = OmniConfig::from_file(path).unwrap();
+        assert_eq!(config.thinker_config.text_config.hidden_size, 2048);
+        assert_eq!(config.thinker_config.text_config.num_hidden_layers, 36);
+        assert_eq!(config.thinker_config.audio_config.d_model, 1280);
+        assert_eq!(config.thinker_config.audio_config.encoder_layers, 32);
+        assert_eq!(config.thinker_config.audio_config.encoder_attention_heads, 20);
+        assert_eq!(config.talker_config.hidden_size, 896);
+        assert_eq!(config.talker_config.num_hidden_layers, 24);
+        assert_eq!(config.talker_config.vocab_size, 8448);
     }
 }
