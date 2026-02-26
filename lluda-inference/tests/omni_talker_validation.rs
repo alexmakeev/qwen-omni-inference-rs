@@ -133,7 +133,11 @@ fn load_npy_f32(path: &str) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error
     let reader = File::open(path)?;
     let arr: ArrayD<f32> = ArrayD::read_npy(reader)?;
     let shape = arr.shape().to_vec();
-    let (data, _) = arr.into_raw_vec_and_offset();
+    // Ensure C-order (row-major) layout. Numpy may store arrays in Fortran order
+    // (F-contiguous) when the source tensor was non-contiguous (e.g. transposed).
+    // into_raw_vec_and_offset() reflects storage order, so we must normalize first.
+    let c_contiguous = arr.as_standard_layout();
+    let (data, _) = c_contiguous.into_owned().into_raw_vec_and_offset();
     Ok((data, shape))
 }
 
@@ -141,7 +145,9 @@ fn load_npy_i64(path: &str) -> Result<(Vec<i64>, Vec<usize>), Box<dyn std::error
     let reader = File::open(path)?;
     let arr: ArrayD<i64> = ArrayD::read_npy(reader)?;
     let shape = arr.shape().to_vec();
-    let (data, _) = arr.into_raw_vec_and_offset();
+    // Same C-order normalization.
+    let c_contiguous = arr.as_standard_layout();
+    let (data, _) = c_contiguous.into_owned().into_raw_vec_and_offset();
     Ok((data, shape))
 }
 

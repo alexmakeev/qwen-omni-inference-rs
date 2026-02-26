@@ -302,6 +302,45 @@ impl AudioEncoder {
         self.proj.forward(&h)
     }
 
+    /// Run the encoder step-by-step and return all intermediate tensors.
+    ///
+    /// Used for diagnostic tests to pinpoint where Rust diverges from Python.
+    ///
+    /// # Returns
+    ///
+    /// `Ok((after_conv_stem, after_pos_embed, layer_outputs))` where:
+    /// - `after_conv_stem`  — output after conv1+gelu+conv2+gelu+transpose, shape `[T/2, d_model]`
+    /// - `after_pos_embed`  — after adding positional embedding, shape `[T/2, d_model]`
+    /// - `layer_outputs`    — Vec of per-layer hidden states, each `[T/2, d_model]`
+    pub fn forward_diagnostic(
+        &self,
+        mel: &Tensor,
+    ) -> Result<(Tensor, Tensor, Vec<Tensor>)> {
+        // Conv stem
+        let h = self.conv1.forward(mel)?;
+        let h = h.gelu()?;
+        let h = self.conv2.forward(&h)?;
+        let h = h.gelu()?;
+        let h = h.transpose()?;
+        let after_conv_stem = h.clone();
+
+        // Positional embedding
+        let seq_len = h.shape()[0];
+        let pos = self.positional_embedding.narrow(0, 0, seq_len)?;
+        let h = h.add(&pos)?;
+        let after_pos_embed = h.clone();
+
+        // Transformer layers
+        let mut h = h;
+        let mut layer_outputs = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            h = layer.forward(&h)?;
+            layer_outputs.push(h.clone());
+        }
+
+        Ok((after_conv_stem, after_pos_embed, layer_outputs))
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Generate sinusoidal positional embedding matching Whisper/Qwen2.5-Omni.

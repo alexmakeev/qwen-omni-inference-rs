@@ -196,10 +196,17 @@ fn load_npy_3d(path: &Path) -> Result<Array3<f32>, Box<dyn std::error::Error>> {
     Ok(array.into_dimensionality::<ndarray::Ix3>()?)
 }
 
-/// Load a .npy file as a dynamic-dimensional array.
+/// Load a .npy file as a dynamic-dimensional array in C-order (row-major).
+///
+/// Numpy files saved from PyTorch may be stored in Fortran order (column-major)
+/// when the source tensor was non-contiguous (e.g. after .transpose()).
+/// This function normalizes the array to standard C (row-major) layout so that
+/// `into_raw_vec_and_offset()` returns elements in the expected C-order.
 fn load_npy_dyn(path: &Path) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
     let reader = File::open(path)?;
-    Ok(ArrayD::read_npy(reader)?)
+    let arr: ArrayD<f32> = ArrayD::read_npy(reader)?;
+    // as_standard_layout() is a no-op if already C-contiguous, or copies to C-order if Fortran.
+    Ok(arr.as_standard_layout().into_owned())
 }
 
 /// Load a .npy file as a 1D i64 array (for input_ids).
@@ -221,7 +228,8 @@ fn load_npy_i64_2d(path: &Path) -> Result<Array2<i64>, Box<dyn std::error::Error
 /// Load a .npy file as a dynamic-dimensional i64 array (for input_ids).
 fn load_npy_i64_dyn(path: &Path) -> Result<ArrayD<i64>, Box<dyn std::error::Error>> {
     let reader = File::open(path)?;
-    Ok(ArrayD::read_npy(reader)?)
+    let arr: ArrayD<i64> = ArrayD::read_npy(reader)?;
+    Ok(arr.as_standard_layout().into_owned())
 }
 
 /// Compute validation metrics comparing two flat f32 slices.
