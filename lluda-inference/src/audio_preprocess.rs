@@ -7,14 +7,18 @@
 //!
 //! ```text
 //! WAV file → PCM samples (f32, mono, 16kHz)
-//!          → STFT (FFT size 400, hop 160, Hann window)
+//!          → Reflect-pad by N_FFT/2
+//!          → STFT (FFT size 400, hop 160, Hann window, center=True)
+//!          → Drop last STFT frame (matching WhisperFeatureExtractor stft[..., :-1])
 //!          → Power spectrum
-//!          → Mel filterbank (128 bins, 0–8000 Hz)
+//!          → Mel filterbank (128 bins, 0–8000 Hz, Slaney/O'Shaughnessy mel scale)
 //!          → Log10 + Whisper normalization
 //!          → Tensor [128, T]
 //! ```
 //!
-//! Parameters match Whisper and Qwen2.5-Omni exactly.
+//! Parameters match WhisperFeatureExtractor (HuggingFace) used in Qwen2.5-Omni exactly.
+//! The mel filterbank uses the Slaney (O'Shaughnessy) mel scale — the same as
+//! librosa's default (htk=False) — not the HTK logarithmic formula.
 
 use crate::error::{LludaError, Result};
 use crate::tensor::Tensor;
@@ -210,11 +214,22 @@ pub fn mel_spectrogram(samples: &[f32]) -> Result<Tensor> {
         }
     }
 
+    // Drop the last STFT frame to match WhisperFeatureExtractor behavior:
+    // Python does `stft[..., :-1]` immediately after computing the STFT.
+    // mel_spec was allocated for num_frames columns; we only use num_frames - 1.
+    let stft_frames = num_frames;       // original frame count (with last frame)
+    let num_frames = num_frames - 1;    // effective frame count (last frame dropped)
+
     // 4. Log10 scale — clamp at 1e-10 to avoid -inf.
-    let mut log_spec: Vec<f32> = mel_spec
-        .iter()
-        .map(|&x| x.max(1e-10_f32).log10())
-        .collect();
+    // Build log_spec with shape [N_MELS, num_frames], skipping the last column.
+    let mut log_spec: Vec<f32> = Vec::with_capacity(N_MELS * num_frames);
+    for mel_idx in 0..N_MELS {
+        let row_start = mel_idx * stft_frames;
+        for frame_idx in 0..num_frames {
+            let val = mel_spec[row_start + frame_idx];
+            log_spec.push(val.max(1e-10_f32).log10());
+        }
+    }
 
     // 5. Whisper normalization:
     //    clip to [max_val - 8, ∞), shift by +4, divide by 4 → range ≈ [-1, 1].
@@ -247,8 +262,16 @@ fn hann_window(size: usize) -> Vec<f32> {
 
 /// Build a mel filterbank matrix of shape `[n_mels, n_fft/2 + 1]`.
 ///
-/// Uses the HTK mel scale and Slaney-style area normalization so each
-/// filter has unit area, making the output independent of filter bandwidth.
+/// Uses the Slaney (O'Shaughnessy) mel scale and Slaney-style area normalization,
+/// matching librosa's default `librosa.filters.mel(htk=False)` and the mel filters
+/// embedded in HuggingFace WhisperFeatureExtractor.
+///
+/// The Slaney mel scale is piecewise:
+/// - Linear below 1000 Hz:  `mel = hz * 3/200`
+/// - Logarithmic at/above:  `mel = 15 + ln(hz/1000) / (ln(6.4)/27)`
+///
+/// This differs from the HTK formula (2595 * log10(1 + hz/700)) and produces
+/// different filterbank weights, especially in the low-frequency region.
 ///
 /// # Arguments
 /// * `n_mels`  — Number of mel frequency bins.
@@ -259,9 +282,27 @@ fn hann_window(size: usize) -> Vec<f32> {
 fn mel_filterbank(n_mels: usize, n_fft: usize, sr: f32, fmin: f32, fmax: f32) -> Vec<f32> {
     let fft_bins = n_fft / 2 + 1;
 
-    // HTK mel scale: mel = 2595 · log10(1 + hz / 700)
-    let hz_to_mel = |hz: f32| -> f32 { 2595.0 * (1.0 + hz / 700.0).log10() };
-    let mel_to_hz = |mel: f32| -> f32 { 700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0) };
+    // Slaney (O'Shaughnessy) mel scale — matches librosa default (htk=False).
+    // Piecewise: linear below 1000 Hz, logarithmic at and above 1000 Hz.
+    let f_sp: f32 = 200.0 / 3.0;              // linear slope (Hz per mel unit)
+    let min_log_hz: f32 = 1000.0;             // transition point
+    let min_log_mel: f32 = min_log_hz / f_sp; // = 15.0
+    let logstep: f32 = 6.4_f32.ln() / 27.0;  // logarithmic step
+
+    let hz_to_mel = |hz: f32| -> f32 {
+        if hz < min_log_hz {
+            hz / f_sp
+        } else {
+            min_log_mel + (hz / min_log_hz).ln() / logstep
+        }
+    };
+    let mel_to_hz = |mel: f32| -> f32 {
+        if mel < min_log_mel {
+            mel * f_sp
+        } else {
+            min_log_hz * ((mel - min_log_mel) * logstep).exp()
+        }
+    };
 
     let mel_min = hz_to_mel(fmin);
     let mel_max = hz_to_mel(fmax);
@@ -410,8 +451,9 @@ mod tests {
         let mel = mel_spectrogram(&samples).unwrap();
 
         assert_eq!(mel.shape()[0], N_MELS, "Expected {} mel bins", N_MELS);
-        // num_frames = (16000 + 400 - 400) / 160 + 1 = 101
-        let expected_frames = (samples.len() + N_FFT - N_FFT) / HOP_LENGTH + 1;
+        // stft_frames = (16000 + 400 - 400) / 160 + 1 = 101
+        // WhisperFE drops the last frame: 101 - 1 = 100
+        let expected_frames = (samples.len() + N_FFT - N_FFT) / HOP_LENGTH + 1 - 1;
         assert_eq!(
             mel.shape()[1],
             expected_frames,
@@ -425,8 +467,9 @@ mod tests {
         let samples = vec![0.0f32; 8000]; // 0.5 s
         let mel = mel_spectrogram(&samples).unwrap();
         assert_eq!(mel.shape()[0], N_MELS);
-        // frames = (8000 + 0) / 160 + 1 = 51
-        let expected_frames = samples.len() / HOP_LENGTH + 1;
+        // stft_frames = (8000 + 0) / 160 + 1 = 51
+        // WhisperFE drops the last frame: 51 - 1 = 50
+        let expected_frames = samples.len() / HOP_LENGTH + 1 - 1;
         assert_eq!(mel.shape()[1], expected_frames);
     }
 

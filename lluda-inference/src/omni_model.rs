@@ -393,6 +393,28 @@ impl OmniModel {
         talker.forward(&codec_ids, &last_hidden, 0)
     }
 
+    /// Run only the thinker forward pass and return all hidden states.
+    ///
+    /// Useful for intermediate validation and debugging. Runs the thinker
+    /// transformer on `input_ids` and returns the full hidden state tensor
+    /// of shape `[1, seq_len, hidden_size]`.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_ids` - Text token IDs `[seq_len]`
+    /// * `offset` - Position offset for KV cache (0 on first call)
+    ///
+    /// # Returns
+    ///
+    /// Hidden states of shape `[1, seq_len, hidden_size]`.
+    pub fn forward_thinker(
+        &mut self,
+        input_ids: &[u32],
+        offset: usize,
+    ) -> Result<Tensor> {
+        self.thinker.forward(input_ids, offset)
+    }
+
     /// Clear all KV caches (thinker and talker).
     ///
     /// Call this at the start of a new conversation or generation request.
@@ -401,6 +423,74 @@ impl OmniModel {
         if let Some(ref mut talker) = self.talker {
             talker.clear_kv_cache();
         }
+    }
+
+    /// Incremental text generation step for ASR decoding.
+    ///
+    /// After the ASR prefill (`forward_asr`), the KV cache already contains the full
+    /// audio + text context. This method runs a single additional text token through
+    /// the thinker and LM head **without** re-encoding the mel spectrogram.
+    ///
+    /// # Arguments
+    ///
+    /// * `token_id` - The last generated token ID
+    /// * `offset` - KV cache offset (= total number of tokens already processed)
+    ///
+    /// # Returns
+    ///
+    /// Logits of shape `[1, 1, vocab_size]` for the next token.
+    pub fn forward_text_step(&mut self, token_id: u32, offset: usize) -> Result<Tensor> {
+        // Forward single token through thinker (KV cache holds full prior context)
+        let hidden = self.thinker.forward(&[token_id], offset)?;
+        // hidden: [1, 1, hidden_size]
+
+        // LM head: [1, 1, hidden] → [1, 1, vocab_size]
+        let hidden_size = hidden.shape()[2];
+        let h2d = hidden.reshape(&[1, hidden_size])?;
+        let logits_2d = h2d.matmul(&self.lm_head_transposed)?;
+        let vocab_size = logits_2d.shape()[1];
+        logits_2d.reshape(&[1, 1, vocab_size])
+    }
+
+    /// TTS prefill: encodes text tokens through the thinker and feeds the last hidden
+    /// state as context to the talker's first step.
+    ///
+    /// Returns both the initial codec logits **and** the last thinker hidden state so
+    /// the caller can pass it to the talker on subsequent incremental decoding steps.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_ids` - Text token IDs `[seq_len]`
+    /// * `thinker_offset` - Position offset for the thinker KV cache
+    ///
+    /// # Returns
+    ///
+    /// `(logits, last_thinker_hidden)` where:
+    /// - `logits` has shape `[1, 1, codec_vocab_size]`
+    /// - `last_thinker_hidden` has shape `[1, 1, thinker_hidden_size]`
+    ///
+    /// # Errors
+    ///
+    /// Returns `LludaError::Msg` if the talker is not loaded.
+    pub fn forward_tts_with_hidden(
+        &mut self,
+        input_ids: &[u32],
+        thinker_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // Forward through thinker: [1, seq_len, hidden]
+        let thinker_hidden = self.thinker.forward(input_ids, thinker_offset)?;
+
+        // Extract last thinker hidden state: [1, 1, hidden]
+        let seq_len = thinker_hidden.shape()[1];
+        let last_hidden = thinker_hidden.narrow(1, seq_len - 1, 1)?;
+
+        // Talker first step: tts_codec_start token + last thinker hidden
+        let tts_start = self.config.talker_config.tts_codec_start;
+        let talker = self.talker.as_mut().ok_or_else(|| {
+            LludaError::Msg("Talker not loaded (enable_talker=false)".into())
+        })?;
+        let logits = talker.forward(&[tts_start], &last_hidden, 0)?;
+        Ok((logits, last_hidden))
     }
 
     /// Replace audio placeholder token positions with audio encoder embeddings.
@@ -460,6 +550,156 @@ impl OmniModel {
         // Rebuild as [1, seq_len, hidden]
         Tensor::new(merged, vec![1, seq_len, hidden])
     }
+}
+
+// ── Generation ────────────────────────────────────────────────────────────────
+
+/// Autoregressive ASR text generation.
+///
+/// Runs a two-phase generation loop:
+/// 1. **Prefill**: `forward_asr(mel, input_ids, 0)` encodes the mel spectrogram
+///    together with the prompt tokens. The KV cache is filled with the full
+///    audio + text context and the first new text token is sampled.
+/// 2. **Decode**: each subsequent step calls `forward_text_step(token, offset)`
+///    which forwards only the new token through the thinker (no audio
+///    re-encoding) and samples the next token.
+///
+/// Generation stops when `eos_token_id` is produced or `max_new_tokens` is reached.
+///
+/// # Arguments
+///
+/// * `model` - Mutable reference to an `OmniModel` (KV caches will be reset)
+/// * `mel` - Log-mel spectrogram `[num_mel_bins, T]` for the audio input
+/// * `input_ids` - Prompt token IDs (including audio placeholder tokens)
+/// * `max_new_tokens` - Maximum number of text tokens to generate
+/// * `eos_token_id` - Token ID that signals end of transcription
+///
+/// # Returns
+///
+/// Vector of generated token IDs (not including the prompt).
+///
+/// # Errors
+///
+/// Returns error if any model forward pass fails.
+pub fn generate_asr(
+    model: &mut OmniModel,
+    mel: &Tensor,
+    input_ids: &[u32],
+    max_new_tokens: usize,
+    eos_token_id: u32,
+) -> Result<Vec<u32>> {
+    use crate::generate::sample_greedy;
+
+    if input_ids.is_empty() {
+        return Err(LludaError::Msg("generate_asr: input_ids cannot be empty".into()));
+    }
+
+    model.clear_kv_cache();
+
+    let prefill_len = input_ids.len();
+
+    // ── Prefill ──────────────────────────────────────────────────────────────
+    // forward_asr encodes mel + text and returns logits for the last prompt token.
+    // After this call the thinker KV cache holds `prefill_len` positions.
+    let logits = model.forward_asr(mel, input_ids, 0)?;
+    let first_token = sample_greedy(&logits)?;
+
+    if first_token == eos_token_id {
+        return Ok(vec![first_token]);
+    }
+
+    let mut generated = vec![first_token];
+
+    // ── Decode loop ──────────────────────────────────────────────────────────
+    for step in 1..max_new_tokens {
+        // KV cache already holds `prefill_len + step - 1` positions
+        let offset = prefill_len + step - 1;
+        let last_token = *generated.last().unwrap();
+        let logits = model.forward_text_step(last_token, offset)?;
+        let next_token = sample_greedy(&logits)?;
+        generated.push(next_token);
+        if next_token == eos_token_id {
+            break;
+        }
+    }
+
+    Ok(generated)
+}
+
+/// Autoregressive TTS codec generation.
+///
+/// Runs a two-phase generation loop:
+/// 1. **Prefill**: `forward_tts_with_hidden(input_ids, 0)` runs the thinker on
+///    the text tokens and feeds the last thinker hidden state as context to the
+///    talker together with the `tts_codec_start` token. The talker KV cache is
+///    initialised and the first codec token is sampled.
+/// 2. **Decode**: each subsequent step calls
+///    `talker.forward(&[last_codec], &last_thinker_hidden, offset)` where
+///    `last_thinker_hidden` is the *fixed* hidden state produced during prefill.
+///    The talker attends to its own growing KV cache and to the thinker context
+///    vector at every step.
+///
+/// Generation stops when `codec_eos_token_id` is produced or `max_new_tokens` is reached.
+///
+/// # Arguments
+///
+/// * `model` - Mutable reference to an `OmniModel` with talker loaded
+/// * `input_ids` - Text token IDs to synthesise speech for
+/// * `max_new_tokens` - Maximum number of codec tokens to generate
+/// * `codec_eos_token_id` - Token ID that signals end of codec sequence (default 8294)
+///
+/// # Returns
+///
+/// Vector of generated codec token IDs (not including the start token).
+///
+/// # Errors
+///
+/// Returns `LludaError::Msg` if the talker is not loaded or a forward pass fails.
+pub fn generate_tts_codecs(
+    model: &mut OmniModel,
+    input_ids: &[u32],
+    max_new_tokens: usize,
+    codec_eos_token_id: u32,
+) -> Result<Vec<u32>> {
+    use crate::generate::sample_greedy;
+
+    if input_ids.is_empty() {
+        return Err(LludaError::Msg("generate_tts_codecs: input_ids cannot be empty".into()));
+    }
+
+    model.clear_kv_cache();
+
+    // ── Prefill ──────────────────────────────────────────────────────────────
+    // Returns codec logits for the first position and the last thinker hidden state.
+    // After this call the talker KV cache holds 1 position (the tts_start token).
+    let (logits, last_thinker_hidden) = model.forward_tts_with_hidden(input_ids, 0)?;
+    let first_codec = sample_greedy(&logits)?;
+
+    if first_codec == codec_eos_token_id {
+        return Ok(vec![first_codec]);
+    }
+
+    let mut generated = vec![first_codec];
+
+    // ── Decode loop ──────────────────────────────────────────────────────────
+    for step in 1..max_new_tokens {
+        // Talker KV cache already holds `step` positions (tts_start + prior tokens).
+        let offset = step;
+        let last_codec = *generated.last().unwrap();
+        let talker = model.talker.as_mut().ok_or_else(|| {
+            LludaError::Msg("Talker not loaded (enable_talker=false)".into())
+        })?;
+        // The thinker hidden state is constant after prefill: broadcast the same
+        // last_thinker_hidden as the conditioning vector for each decode step.
+        let logits = talker.forward(&[last_codec], &last_thinker_hidden, offset)?;
+        let next_codec = sample_greedy(&logits)?;
+        generated.push(next_codec);
+        if next_codec == codec_eos_token_id {
+            break;
+        }
+    }
+
+    Ok(generated)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -554,7 +794,35 @@ mod tests {
         assert_eq!(mask[8], 0.0);
     }
 
-    /// Test that merge does not consume more audio frames than available.
+    /// Verify that generate_asr and generate_tts_codecs are importable.
+    ///
+    /// This is a compile-only test: if the functions are accessible and have
+    /// correct signatures the test passes. No model weights are required.
+    #[test]
+    fn test_generation_api_accessible() {
+        // Import the generation functions to confirm they compile and are public.
+        use super::generate_asr;
+        use super::generate_tts_codecs;
+
+        // Capture function pointers to suppress "unused import" warnings while
+        // ensuring the symbols exist in the compiled artifact.
+        let _asr_fn: fn(
+            &mut super::OmniModel,
+            &crate::tensor::Tensor,
+            &[u32],
+            usize,
+            u32,
+        ) -> crate::error::Result<Vec<u32>> = generate_asr;
+
+        let _tts_fn: fn(
+            &mut super::OmniModel,
+            &[u32],
+            usize,
+            u32,
+        ) -> crate::error::Result<Vec<u32>> = generate_tts_codecs;
+    }
+
+/// Test that merge does not consume more audio frames than available.
     #[test]
     fn test_merge_fewer_audio_frames_than_placeholders() {
         let seq_len = 4usize;
