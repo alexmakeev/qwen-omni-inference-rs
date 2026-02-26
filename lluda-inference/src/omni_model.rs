@@ -57,7 +57,7 @@ use crate::tensor::{DType, Tensor};
 /// Uses OmniAttention (biases on q/k/v, no per-head norms).
 /// Different from Qwen3ForCausalLM which has per-head RMSNorm.
 #[derive(Debug, Clone)]
-struct OmniThinker {
+pub struct OmniThinker {
     /// Token embedding layer [vocab_size, hidden_size]
     embed_tokens: Embedding,
     /// Transformer decoder layers
@@ -82,7 +82,7 @@ impl OmniThinker {
     /// # Errors
     ///
     /// Returns `LludaError::Msg` if any required tensor is absent.
-    fn load(
+    pub fn load(
         config: &OmniTextConfig,
         get_tensor: &impl Fn(&str) -> Option<Tensor>,
     ) -> Result<Self> {
@@ -182,7 +182,7 @@ impl OmniThinker {
     /// # Returns
     ///
     /// Hidden states of shape `[1, seq_len, hidden_size]` after all layers and final norm.
-    fn forward_embeds(&mut self, embeds: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward_embeds(&mut self, embeds: &Tensor, offset: usize) -> Result<Tensor> {
         let shape = embeds.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -210,14 +210,14 @@ impl OmniThinker {
     /// # Returns
     ///
     /// Hidden states of shape `[1, seq_len, hidden_size]`.
-    fn forward(&mut self, input_ids: &[u32], offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &[u32], offset: usize) -> Result<Tensor> {
         let seq_len = input_ids.len();
         let embeds = self.embed_tokens.forward(input_ids, &[1, seq_len])?;
         self.forward_embeds(&embeds, offset)
     }
 
     /// Clear all KV caches.
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         for cache in &mut self.kv_caches {
             cache.reset();
         }

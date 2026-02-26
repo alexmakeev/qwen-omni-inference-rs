@@ -164,10 +164,20 @@ pub struct OmniAudioConfig {
     /// Defaults to 1e-5 when not present in the config file.
     #[serde(default = "default_audio_eps")]
     pub layer_norm_eps: f64,
+
+    /// Maximum number of source positions for sinusoidal positional embedding.
+    /// For Qwen2.5-Omni-3B: 1500
+    /// Defaults to 1500 when not present in the config file.
+    #[serde(default = "default_max_source_positions")]
+    pub max_source_positions: usize,
 }
 
 fn default_audio_eps() -> f64 {
     1e-5
+}
+
+fn default_max_source_positions() -> usize {
+    1500
 }
 
 /// Talker (TTS decoder) configuration.

@@ -60,10 +60,13 @@ use crate::tensor::Tensor;
 ///
 /// Loaded from the `thinker.audio_tower.*` namespace:
 /// - `conv1`, `conv2` — convolutional stem weights
-/// - `positional_embedding` — sinusoidal position table [1500, d_model]
 /// - `layers.{i}.*` — 32 transformer encoder layer weights
 /// - `ln_post.*` — final layer normalization
 /// - `proj.*` — linear projection to thinker dimension
+///
+/// NOTE: `positional_embedding` is NOT loaded from safetensors.
+/// It is a non-persistent PyTorch buffer and is computed deterministically via
+/// `sinusoidal_position_embedding` at load time.
 #[derive(Debug, Clone)]
 pub struct AudioEncoder {
     /// First conv: [d_model, num_mel_bins, 3], stride=1, padding=1.
@@ -142,7 +145,11 @@ impl AudioEncoder {
 
         // ── Positional embeddings ─────────────────────────────────────────────
         // Shape: [max_source_positions, d_model] (1500, 1280 for Qwen2.5-Omni-3B)
-        let positional_embedding = get(&format!("{prefix}.positional_embedding"))?;
+        // Not saved in safetensors (non-persistent buffer); computed deterministically.
+        let positional_embedding = Self::sinusoidal_position_embedding(
+            config.max_source_positions,
+            config.d_model,
+        )?;
 
         // ── Transformer encoder layers ────────────────────────────────────────
         let mut layers = Vec::with_capacity(config.encoder_layers);
@@ -297,6 +304,44 @@ impl AudioEncoder {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Generate sinusoidal positional embedding matching Whisper/Qwen2.5-Omni.
+    ///
+    /// The formula is:
+    /// ```text
+    ///   inv_timescales[i] = exp(-ln(10000) * i / (channels/2 - 1))
+    ///   result[pos, i]              = sin(pos * inv_timescales[i])
+    ///   result[pos, channels/2 + i] = cos(pos * inv_timescales[i])
+    /// ```
+    ///
+    /// This matches the non-persistent buffer produced by Whisper and Qwen2.5-Omni
+    /// and is therefore not stored in safetensors checkpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `length`   - Number of positions (rows). Typically 1500.
+    /// * `channels` - Embedding dimension (columns). Must be even. Typically 1280.
+    ///
+    /// # Returns
+    ///
+    /// Tensor of shape `[length, channels]` filled with F32 sinusoidal values.
+    pub(crate) fn sinusoidal_position_embedding(length: usize, channels: usize) -> Result<Tensor> {
+        let half = channels / 2;
+        let log_timescale_increment = (10000.0_f64).ln() / (half - 1) as f64;
+
+        let mut data = vec![0.0f32; length * channels];
+
+        for pos in 0..length {
+            for i in 0..half {
+                let inv_timescale = (-log_timescale_increment * i as f64).exp() as f32;
+                let angle = pos as f32 * inv_timescale;
+                data[pos * channels + i] = angle.sin();
+                data[pos * channels + half + i] = angle.cos();
+            }
+        }
+
+        Tensor::new(data, vec![length, channels])
+    }
+
     /// 1-D average pooling over the first dimension with the given stride.
     ///
     /// Pools consecutive groups of `stride` frames by averaging.
@@ -375,14 +420,15 @@ mod tests {
     ///   ffn_dim      = 16
     ///   output_dim   = 6
     ///   num_layers   = 1
-    ///   max_src_pos  = 32  (positional_embedding height)
+    ///
+    /// Note: positional_embedding is NOT in the weight map — it is computed
+    /// deterministically via sinusoidal_position_embedding.
     fn make_weight_map(
         num_mel_bins: usize,
         d_model: usize,
         ffn_dim: usize,
         output_dim: usize,
         num_layers: usize,
-        max_src_pos: usize,
     ) -> HashMap<String, Tensor> {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         let p = "thinker.audio_tower";
@@ -392,12 +438,6 @@ mod tests {
         map.insert(format!("{p}.conv1.bias"), mk_b(d_model));
         map.insert(format!("{p}.conv2.weight"), mk_w3(d_model, d_model, 3));
         map.insert(format!("{p}.conv2.bias"), mk_b(d_model));
-
-        // Positional embedding
-        map.insert(
-            format!("{p}.positional_embedding"),
-            mk_w(max_src_pos, d_model),
-        );
 
         // Transformer layers
         for i in 0..num_layers {
@@ -428,6 +468,79 @@ mod tests {
         map
     }
 
+    // ── Test: sinusoidal_position_embedding ──────────────────────────────────
+
+    /// Verify shape and known boundary values for sinusoidal positional embedding.
+    ///
+    /// Mathematical anchors:
+    ///   pos=0, i=0        → sin(0) = 0.0
+    ///   pos=0, i=channels/2 → cos(0) = 1.0
+    ///   pos=1, i=0        → sin(1 * exp(0)) = sin(1.0)
+    #[test]
+    fn test_sinusoidal_position_embedding() {
+        let pe = AudioEncoder::sinusoidal_position_embedding(1500, 1280).unwrap();
+        assert_eq!(pe.shape(), &[1500, 1280]);
+
+        let data = pe.to_vec_f32();
+        // Position 0, first element: sin(0) = 0
+        assert!((data[0] - 0.0).abs() < 1e-6, "pe[0,0] should be sin(0)=0, got {}", data[0]);
+        // Position 0, element at channels/2: cos(0) = 1
+        assert!(
+            (data[640] - 1.0).abs() < 1e-6,
+            "pe[0,640] should be cos(0)=1, got {}",
+            data[640]
+        );
+        // Position 1, first element: sin(1 * exp(0)) = sin(1.0)
+        let expected = 1.0_f32.sin();
+        assert!(
+            (data[1280] - expected).abs() < 1e-4,
+            "pe[1,0] should be sin(1.0)={}, got {}",
+            expected,
+            data[1280]
+        );
+    }
+
+    /// Verify that the reference .npy matches our generated embedding if available.
+    #[test]
+    fn test_sinusoidal_embedding_matches_reference() {
+        let ref_path = "/home/alexmak/lluda/reference_data/omni_3b/positional_embedding.npy";
+        if !std::path::Path::new(ref_path).exists() {
+            eprintln!("Skipping: reference not found at {}", ref_path);
+            return;
+        }
+
+        // Read the .npy file manually: header + raw f32 data.
+        // Standard npy format: magic "\x93NUMPY", version byte × 2, header_len LE u16, header, data.
+        let raw = std::fs::read(ref_path).expect("Failed to read reference npy");
+        // Parse npy header to get data offset
+        assert_eq!(&raw[0..6], b"\x93NUMPY", "Not a valid .npy file");
+        let header_len = u16::from_le_bytes([raw[8], raw[9]]) as usize;
+        let data_offset = 10 + header_len;
+        let float_bytes = &raw[data_offset..];
+        let ref_data: Vec<f32> = float_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let pe = AudioEncoder::sinusoidal_position_embedding(1500, 1280).unwrap();
+        let our_data = pe.to_vec_f32();
+
+        assert_eq!(our_data.len(), ref_data.len(), "Length mismatch vs reference");
+
+        let max_diff: f32 = our_data
+            .iter()
+            .zip(ref_data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("Positional embedding max diff from Python: {:.6e}", max_diff);
+        assert!(
+            max_diff < 1e-3,
+            "Positional embedding diverges from reference: max_diff={}",
+            max_diff
+        );
+    }
+
     // ── Test: avg_pool_1d ────────────────────────────────────────────────────
 
     /// avg_pool_1d with stride=2 on a known input.
@@ -449,10 +562,8 @@ mod tests {
         let ffn_dim = 16;
         let output_dim = 6;
         let num_layers = 1;
-        let max_src_pos = 32;
 
-        let weights =
-            make_weight_map(num_mel_bins, d_model, ffn_dim, output_dim, num_layers, max_src_pos);
+        let weights = make_weight_map(num_mel_bins, d_model, ffn_dim, output_dim, num_layers);
 
         let config = OmniAudioConfig {
             d_model,
@@ -462,6 +573,7 @@ mod tests {
             output_dim,
             num_mel_bins,
             layer_norm_eps: 1e-5,
+            max_source_positions: 32,
         };
 
         let encoder =
@@ -491,7 +603,7 @@ mod tests {
     ///
     /// Tiny configuration:
     ///   num_mel_bins = 4, d_model = 8, num_heads = 2, head_dim = 4
-    ///   ffn_dim = 16, output_dim = 6, num_layers = 1, max_src_pos = 32
+    ///   ffn_dim = 16, output_dim = 6, num_layers = 1, max_source_positions = 32
     ///
     /// Input mel: [4, 16]
     ///   conv1 (stride=1, pad=1): [8, 16]
@@ -509,10 +621,8 @@ mod tests {
         let ffn_dim = 16;
         let output_dim = 6;
         let num_layers = 1;
-        let max_src_pos = 32;
 
-        let weights =
-            make_weight_map(num_mel_bins, d_model, ffn_dim, output_dim, num_layers, max_src_pos);
+        let weights = make_weight_map(num_mel_bins, d_model, ffn_dim, output_dim, num_layers);
 
         let config = OmniAudioConfig {
             d_model,
@@ -522,6 +632,7 @@ mod tests {
             output_dim,
             num_mel_bins,
             layer_norm_eps: 1e-5,
+            max_source_positions: 32,
         };
 
         let encoder =
@@ -556,6 +667,7 @@ mod tests {
             output_dim: 6,
             num_mel_bins: 4,
             layer_norm_eps: 1e-5,
+            max_source_positions: 32,
         };
 
         let result = AudioEncoder::load(&config, |_name| None);
